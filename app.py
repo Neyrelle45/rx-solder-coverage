@@ -6,7 +6,7 @@ import joblib
 import analyse_rx_soudure as engine
 import os
 
-st.set_page_config(page_title="Contrôle Qualité RX", layout="wide")
+st.set_page_config(page_title="Contrôle Qualité RX - Voids", layout="wide")
 
 @st.cache_resource
 def load_trained_model(file_upload):
@@ -19,7 +19,7 @@ model_file = st.sidebar.file_uploader("Modèle (.joblib)", type=["joblib"])
 
 if model_file:
     clf = load_trained_model(model_file)
-    st.header("🎯 Analyse Précise des Voids")
+    st.header("🎯 Analyse Précise du Top 5 Voids")
     
     col_u1, col_u2 = st.columns(2)
     with col_u1:
@@ -34,7 +34,7 @@ if model_file:
         img_gray = engine.load_gray("temp_rx.png")
         H, W = img_gray.shape
 
-        # --- Réglages ---
+        # --- Sidebar Alignement ---
         st.sidebar.subheader("🕹️ Ajustement")
         tx = st.sidebar.number_input("X (px)", value=0.0, step=1.0)
         ty = st.sidebar.number_input("Y (px)", value=0.0, step=1.0)
@@ -50,48 +50,50 @@ if model_file:
         M = engine.compose_similarity(scale, rot, tx, ty, cx, cy)
         zone_adj = cv2.warpAffine(zone_base, M, (W, H), flags=cv2.INTER_NEAREST)
 
-        with st.spinner("Analyse IA..."):
+        with st.spinner("Analyse IA en cours..."):
             feats = engine.compute_features(img_gray)
             pred = clf.predict(feats.reshape(-1, feats.shape[-1])).reshape(H, W)
             pred_bin = (pred == 1).astype(np.uint8) * 255 
 
-        # --- DÉTECTION DES VOIDS (CERCLAGE UNIQUEMENT) ---
+        # --- DÉTECTION DES VOIDS (Holes in solder) ---
         solder_map = np.zeros((H,W), dtype=np.uint8)
         solder_map[(zone_adj > 0) & (pred_bin > 0)] = 255
         
-        # On utilise la hiérarchie pour trouver les trous DANS la soudure
+        # RETR_CCOMP pour isoler les trous internes à la soudure
         contours, hierarchy = cv2.findContours(solder_map, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         
-        voids_found = []
+        voids_all = []
         if hierarchy is not None:
             for i, h in enumerate(hierarchy[0]):
-                if h[3] != -1: # C'est un trou interne
+                if h[3] != -1: # Uniquement les trous internes
                     cnt = contours[i]
                     area = cv2.contourArea(cnt)
-                    if area > 2:
-                        voids_found.append({"area": area, "contour": cnt})
+                    if area > 2: # Seuil minimum pour filtrer le bruit
+                        voids_all.append({"area": area, "contour": cnt})
 
-        voids_found = sorted(voids_found, key=lambda x: x['area'], reverse=True)
+        # TRI ET LIMITATION AU TOP 5
+        voids_top5 = sorted(voids_all, key=lambda x: x['area'], reverse=True)[:5]
 
         # --- VISUALISATION ---
         overlay_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay_rgb[zone_adj > 0] = [255, 0, 0] # Fond Rouge
-        overlay_rgb[(zone_adj > 0) & (pred_bin > 0)] = [255, 255, 0] # Soudure Jaune
+        overlay_rgb[zone_adj > 0] = [255, 0, 0] # Rouge (Manque)
+        overlay_rgb[(zone_adj > 0) & (pred_bin > 0)] = [255, 255, 0] # Jaune (Soudure)
 
-        # Cerclage CYAN FIN pour tous les voids
-        for v in voids_found[:10]: # On cercle les 10 plus gros
-            cv2.drawContours(overlay_rgb, [v['contour']], -1, [0, 255, 255], 1) # Épaisseur 1 pour la finesse
+        # CERCLAGE CYAN (Épaisseur 2 et limite stricte aux 5 plus gros)
+        for v in voids_top5:
+            cv2.drawContours(overlay_rgb, [v['contour']], -1, [0, 255, 255], 2)
 
-        # --- TABLEAUX ---
+        # --- AFFICHAGE ET TABLEAUX ---
         st.divider()
         res_col1, res_col2 = st.columns([2, 1])
 
         with res_col1:
-            st.image(overlay_rgb, caption="Jaune=Soudure | Rouge=Manque | Cyan=Cerclage Voids", use_container_width=True)
+            st.image(overlay_rgb, caption="Top 5 Voids Identifiés (Cerclage Cyan)", use_container_width=True)
             
+            # Bouton de téléchargement
             result_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
             _, buffer = cv2.imencode('.png', result_bgr)
-            st.download_button("💾 Télécharger", buffer.tobytes(), "analyse_voids.png")
+            st.download_button("💾 Télécharger l'image", buffer.tobytes(), f"analyse_top5_{rx_upload.name}")
 
         with res_col2:
             total_px = int(np.sum(zone_adj > 0))
@@ -100,18 +102,16 @@ if model_file:
             
             st.subheader("📊 Taux Global")
             st.table(pd.DataFrame({
-                "Métriques": ["Surface Totale", "Soudure", "Manque"],
+                "Métriques": ["Surface Totale", "Soudure Réelle", "Manque Global"],
                 "Pixels": [total_px, solder_px, missing_px]
             }))
-            st.metric("Manque Total / Zone", f"{(missing_px/total_px*100):.2f} %")
+            st.metric("Taux de Manque Total", f"{(missing_px/total_px*100):.2f} %")
 
             st.divider()
-            st.subheader("🔝 Top 5 Voids")
-            if voids_found:
+            st.subheader("🔝 Top 5 Voids (Détails)")
+            if voids_top5:
                 v_list = []
-                for i, v in enumerate(voids_found[:5]):
-                    # On affiche le % par rapport à la zone totale
-                    # Si vous voulez le % par rapport à la soudure détectée : (v['area']/solder_px*100)
+                for i, v in enumerate(voids_top5):
                     v_pct = (v['area'] / total_px * 100)
                     v_list.append({
                         "Rang": i+1, 
@@ -121,3 +121,5 @@ if model_file:
                 st.table(pd.DataFrame(v_list))
             else:
                 st.info("Aucun void détecté.")
+else:
+    st.info("Veuillez charger votre modèle .joblib.")
