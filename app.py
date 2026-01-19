@@ -32,12 +32,12 @@ if model_file:
         with col2:
             mask_upload = st.file_uploader("Masque Unique", type=["png", "jpg", "jpeg"])
 
-        if rx_upload and mask_upload:
-            # Traitement image
-               with open("temp_file.png", "wb") as f:
-            f.write(rx_upload.getbuffer())
-
-            img_gray = engine.load_gray("temp_file.png")
+if rx_upload and mask_upload:
+            # Assurez-vous que tout ce qui suit est décalé de 4 espaces supplémentaires
+            with open("temp_file.png", "wb") as f:
+                f.write(rx_upload.getbuffer()) # Cette ligne doit être alignée sous le 'w' de with
+            
+            img_gray = engine.load_gray("temp_file.png") 
             H, W = img_gray.shape
             
             # Paramètres d'alignement manuel
