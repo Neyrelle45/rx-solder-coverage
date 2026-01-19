@@ -1,5 +1,4 @@
 
-%%writefile analyse_rx_soudure.py
 # analyse_rx_soudure.py
 # Auteur : Pierre (assisté par M365 Copilot)
 # Objet : % de couverture de soudure dans la zone utile (VERT − trous NOIR)
