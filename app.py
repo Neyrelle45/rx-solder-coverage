@@ -34,7 +34,10 @@ if model_file:
 
         if rx_upload and mask_upload:
             # Traitement image
-            img_gray = engine.load_gray(rx_upload) # Adapté pour lire directement le buffer si load_gray le permet
+               with open("temp_file.png", "wb") as f:
+            f.write(rx_upload.getbuffer())
+
+            img_gray = engine.load_gray("temp_file.png")
             H, W = img_gray.shape
             
             # Paramètres d'alignement manuel
