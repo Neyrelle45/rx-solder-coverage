@@ -10,7 +10,7 @@ import analyse_rx_soudure as engine
 
 st.set_page_config(page_title="Station Analyse RX - Expert Voids", layout="wide")
 
-# Initialisation du stockage en session
+# --- INITIALISATION PROPRE DES VARIABLES DE SESSION ---
 if 'history' not in st.session_state:
     st.session_state.history = []
 if 'selected_image' not in st.session_state:
@@ -18,11 +18,13 @@ if 'selected_image' not in st.session_state:
 
 st.sidebar.title("🛠️ Configuration")
 
-# BOUTON DE VIDAGE (Reset)
+# --- BOUTON DE VIDAGE AMÉLIORÉ ---
+# On ne fait plus un st.rerun() brutal, on vide juste la liste
 if st.sidebar.button("🗑️ Effacer l'historique session", use_container_width=True):
     st.session_state.history = []
     st.session_state.selected_image = None
-    st.rerun()
+    st.sidebar.success("Historique vidé !")
+    # Pas de st.rerun() ici pour ne pas perdre les chargements en cours
 
 st.sidebar.divider()
 
@@ -30,8 +32,14 @@ st.sidebar.divider()
 contrast_val = st.sidebar.slider("Contraste (CLAHE)", 0.0, 10.0, 2.0, 0.5)
 model_file = st.sidebar.file_uploader("Charger modèle (.joblib)", type=["joblib"])
 
+# --- L'INTERFACE RESTE VISIBLE TANT QUE LE MODÈLE EST CHARGÉ ---
 if model_file:
-    clf = joblib.load(model_file)
+    # On utilise st.cache_resource pour ne pas recharger le modèle à chaque clic
+    @st.cache_resource
+    def load_my_model(file):
+        return joblib.load(file)
+    
+    clf = load_my_model(model_file)
     st.sidebar.success("Modèle opérationnel")
 
     st.header("🔍 Analyse de Soudure & Indice de Confiance")
@@ -54,10 +62,10 @@ if model_file:
         rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0, 0.5)
         scale = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0, 0.001)
 
+        # Extraction masques
         with open("temp_app_mask.png", "wb") as f:
             f.write(mask_upload.getbuffer())
         
-        # Extraction masques
         insp = cv2.imread("temp_app_mask.png", cv2.IMREAD_COLOR)
         b_c, g_c, r_c = cv2.split(insp)
         mask_green_raw = (g_c > 100).astype(np.uint8) 
@@ -74,28 +82,20 @@ if model_file:
         envelope_adj = cv2.warpAffine(mask_green_raw, M, (W, H), flags=cv2.INTER_NEAREST)
         holes_adj = cv2.warpAffine(mask_black_raw, M, (W, H), flags=cv2.INTER_NEAREST)
 
-        # --- ANALYSE IA AVEC PROBABILITÉS ---
-        with st.spinner("Analyse IA et calcul de confiance..."):
+        # --- ANALYSE IA ---
+        with st.spinner("Analyse IA en cours..."):
             features = engine.compute_features(img_gray)
             n_features = features.shape[-1] 
             flat_features = features.reshape(-1, n_features)
             
             try:
-                # Calcul des probabilités pour chaque classe
                 probs = clf.predict_proba(flat_features) 
-                # La prédiction finale reste la classe avec la proba max
                 pred_flat = np.argmax(probs, axis=1)
                 pred_map = pred_flat.reshape(H, W)
-                
-                # Calcul de la confiance : probabilité de la classe choisie
-                conf_flat = np.max(probs, axis=1)
-                conf_map = conf_flat.reshape(H, W)
-                
-                # Confiance moyenne uniquement sur la zone utile
+                conf_map = np.max(probs, axis=1).reshape(H, W)
                 mean_conf = np.mean(conf_map[zone_adj > 0]) * 100 if np.any(zone_adj > 0) else 0
-                
-            except (ValueError, AttributeError) as e:
-                st.error(f"Le modèle ne supporte pas predict_proba ou les dimensions divergent: {e}")
+            except:
+                st.error("Erreur IA: Vérifiez la compatibilité du modèle.")
                 st.stop()
 
         # --- FILTRAGE VOIDS ---
@@ -112,13 +112,11 @@ if model_file:
             if area < 3.0: continue
             c_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(c_mask, [c], -1, 255, -1) 
-            contains_via = np.any((c_mask > 0) & (holes_adj > 0))
-            border_mask = np.zeros((H, W), dtype=np.uint8)
-            cv2.drawContours(border_mask, [c], -1, 255, 1)
-            touches_edge = np.any((cv2.dilate(border_mask, np.ones((3,3))) > 0) & (envelope_adj == 0))
-            
-            if not touches_edge and not contains_via:
-                internal_voids.append({'area': area, 'poly': c})
+            if not np.any((c_mask > 0) & (holes_adj > 0)):
+                border_mask = np.zeros((H, W), dtype=np.uint8)
+                cv2.drawContours(border_mask, [c], -1, 255, 1)
+                if not np.any((cv2.dilate(border_mask, np.ones((3,3))) > 0) & (envelope_adj == 0)):
+                    internal_voids.append({'area': area, 'poly': c})
         
         top_5 = sorted(internal_voids, key=lambda x: x['area'], reverse=True)[:5]
 
@@ -129,66 +127,51 @@ if model_file:
         for v in top_5:
             cv2.drawContours(overlay, [v['poly']], -1, [0, 255, 255], 2)
 
-        # --- RÉSULTATS & ARCHIVAGE ---
+        # --- RÉSULTATS ---
         st.divider()
         c_res, c_img = st.columns([1, 2])
         with c_res:
             st.metric("Manque Total", f"{missing_pct:.2f} %")
-            
-            # Affichage du taux de confiance avec couleur dynamique
-            color_conf = "inverse" if mean_conf < 85 else "normal"
-            st.metric("Indice de Confiance IA", f"{mean_conf:.1f} %", delta=f"{mean_conf-100:.1f}%", delta_color=color_conf)
-            
-            st.write("📏 **Top 5 Voids (Bulles Internes)**")
-            void_stats = {}
-            for i in range(5):
-                v_pct = (top_5[i]['area'] / area_total_px * 100) if i < len(top_5) else 0.0
-                st.write(f"Void {i+1} : {v_pct:.3f} %")
-                void_stats[f"V{i+1}"] = round(v_pct, 3)
+            st.metric("Confiance IA", f"{mean_conf:.1f} %")
             
             if st.button("📥 Archiver l'analyse"):
                 entry = {
                     "Fichier": rx_upload.name, 
                     "Total_%": round(missing_pct, 2),
-                    "Confiance_%": round(mean_conf, 2),
+                    "Confiance_%": round(mean_conf, 1),
                     "image": overlay.copy(),
-                    "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    "date": datetime.datetime.now().strftime("%H:%M:%S")
                 }
-                entry.update(void_stats)
                 st.session_state.history.append(entry)
-                st.success("Archivé !")
+                st.toast("Analyse ajoutée à l'historique")
 
         with c_img:
-            st.image(overlay, caption="Analyse active (Jaune: OK, Cyan: Voids)", use_container_width=True)
+            st.image(overlay, caption="Résultat visuel", use_container_width=True)
 
-# --- SECTION RAPPORT ET EXPORT ---
+# --- AFFICHAGE DE L'HISTORIQUE (TOUJOURS EN BAS) ---
 if st.session_state.history:
     st.divider()
     st.subheader("📊 Rapport de Session")
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    zip_buffer = io.BytesIO()
     
-    with zipfile.ZipFile(zip_buffer, "w") as z:
-        df_export = pd.DataFrame(st.session_state.history).drop(columns=['image'])
-        z.writestr(f"rapport_{timestamp}.csv", df_export.to_csv(index=False))
-        for idx, item in enumerate(st.session_state.history):
-            img_bgr = cv2.cvtColor(item['image'], cv2.COLOR_RGB2BGR)
-            _, img_encoded = cv2.imencode(".png", img_bgr)
-            z.writestr(f"images/{idx+1}_{item['Fichier'].split('.')[0]}.png", img_encoded.tobytes())
+    # Export ZIP
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        df_exp = pd.DataFrame(st.session_state.history).drop(columns=['image'])
+        z.writestr("rapport.csv", df_exp.to_csv(index=False))
+        for i, item in enumerate(st.session_state.history):
+            _, img_enc = cv2.imencode(".png", cv2.cvtColor(item['image'], cv2.COLOR_RGB2BGR))
+            z.writestr(f"images/{i+1}_{item['Fichier']}.png", img_enc.tobytes())
 
-    st.download_button("🎁 Télécharger le Pack Complet (.zip)", zip_buffer.getvalue(), f"export_{timestamp}.zip", "application/zip", use_container_width=True)
+    st.download_button("🎁 Télécharger ZIP", buf.getvalue(), "export.zip", "application/zip")
 
+    # Galerie
     cols = st.columns(6)
     for idx, item in enumerate(st.session_state.history):
         with cols[idx % 6]:
-            thumb = cv2.resize(item['image'], (150, 150))
-            if st.button(f"🔎 {item['Fichier']}", key=f"btn_{idx}"):
+            if st.button(f"🔎 {idx+1}", key=f"btn_{idx}"):
                 st.session_state.selected_image = item['image']
-            st.image(thumb, use_container_width=True)
+            st.image(cv2.resize(item['image'], (150, 150)), use_container_width=True)
 
     if st.session_state.selected_image is not None:
         st.image(st.session_state.selected_image, use_container_width=True)
         if st.button("Fermer la vue"): st.session_state.selected_image = None
-
-    st.table(df_export)
