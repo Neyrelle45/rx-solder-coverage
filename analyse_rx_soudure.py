@@ -1,4 +1,5 @@
 
+%%writefile analyse_rx_soudure.py
 # analyse_rx_soudure.py
 # Auteur : Pierre (assisté par M365 Copilot)
 # Objet : % de couverture de soudure dans la zone utile (VERT − trous NOIR)
@@ -44,20 +45,41 @@ def list_images(d: str):
     )
 
 def load_gray(path: str) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    # 1. Lecture de l'image (Gestion du cas Streamlit ou chemin disque)
+    if hasattr(path, 'read'):
+        file_bytes = np.asarray(bytearray(path.read()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
+    else:
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+
     if img is None:
-        raise FileNotFoundError(path)
+        raise FileNotFoundError(str(path))
+
+    # 2. Conversion en niveaux de gris si nécessaire
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 3. Normalisation des formats (16-bit vers 8-bit)
     if img.dtype == np.uint16:
         mn, mx = int(img.min()), int(img.max())
         if mx == mn:
-            return np.zeros_like(img, dtype=np.uint8)
-        return ((img.astype(np.float32) - mn) / (mx - mn) * 255.0).astype(np.uint8)
-    if img.dtype != np.uint8:
-        return cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    return img
+            img = np.zeros_like(img, dtype=np.uint8)
+        else:
+            img = ((img.astype(np.float32) - mn) / (mx - mn) * 255.0).astype(np.uint8)
+    elif img.dtype != np.uint8:
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
+    # ==========================================
+    # PATCH : AMÉLIORATION DU CONTRASTE (CLAHE)
+    # ==========================================
+    # On crée l'égaliseur de contraste adaptatif
+    # clipLimit=2.0 évite d'amplifier trop le bruit numérique
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    img = clahe.apply(img)
+    # ==========================================
+
+    return img
+    
 def apply_clahe(img: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8)) -> np.ndarray:
     return cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size).apply(img)
 
@@ -465,7 +487,7 @@ def manual_align_single(img: np.ndarray,
 # TRAIN
 # =========================
 def train_model(images_dir: str, labels_dir: str, models_dir: str = "./MyDrive/OBC_mainboard/models",
-                n_estimators: int = 300, max_samples_per_image: int = 40000):
+                n_estimators: int = 500, max_samples_per_image: int = 40000):
     ensure_dir(models_dir)
     ims = list_images(images_dir)
     if not ims:
@@ -751,3 +773,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
