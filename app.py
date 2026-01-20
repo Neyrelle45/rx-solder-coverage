@@ -113,4 +113,66 @@ if model_file:
             void_stats = {}
             for i in range(5):
                 # Calcul sécurisé du pourcentage par void
-                v_pct = (top_5[i]['area']
+                v_pct = (top_5[i]['area'] / area_total_px * 100) if i < len(top_5) else 0.0
+                st.write(f"Void {i+1} : {v_pct:.3f} %")
+                void_stats[f"V{i+1}"] = round(v_pct, 3)
+            
+            if st.button("📥 Archiver l'analyse"):
+                entry = {
+                    "Fichier": rx_upload.name, 
+                    "Total_%": round(missing_pct, 2), 
+                    "image": overlay.copy(),
+                    "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                entry.update(void_stats)
+                st.session_state.history.append(entry)
+                st.success("Archivé dans la session !")
+
+        with c_img:
+            st.image(overlay, caption="Analyse active (Jaune: OK, Rouge: Manque, Cyan: Voids)", use_container_width=True)
+
+# --- SECTION RAPPORT ET EXPORT ---
+if st.session_state.history:
+    st.divider()
+    st.subheader("📊 Rapport de Session")
+
+    # Préparation du ZIP
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, "w") as z:
+        # CSV (on retire l'objet image pour le tableau)
+        df_export = pd.DataFrame(st.session_state.history).drop(columns=['image'])
+        z.writestr(f"rapport_{timestamp}.csv", df_export.to_csv(index=False))
+        
+        # Images
+        for idx, item in enumerate(st.session_state.history):
+            img_bgr = cv2.cvtColor(item['image'], cv2.COLOR_RGB2BGR)
+            _, img_encoded = cv2.imencode(".png", img_bgr)
+            clean_name = item['Fichier'].split('.')[0]
+            z.writestr(f"images/{idx+1}_{clean_name}_analyse.png", img_encoded.tobytes())
+
+    st.download_button(
+        label="🎁 Télécharger le Pack Complet (.zip)",
+        data=zip_buffer.getvalue(),
+        file_name=f"export_session_{timestamp}.zip",
+        mime="application/zip"
+    )
+
+    # Galerie miniatures cliquables
+    cols = st.columns(6)
+    for idx, item in enumerate(st.session_state.history):
+        with cols[idx % 6]:
+            thumb = cv2.resize(item['image'], (150, 150))
+            if st.button(f"🔎 {item['Fichier']}", key=f"btn_{idx}"):
+                st.session_state.selected_image = item['image']
+            st.image(thumb, use_container_width=True)
+
+    # Vue détaillée
+    if st.session_state.selected_image is not None:
+        st.markdown("### 🖼️ Vue détaillée")
+        st.image(st.session_state.selected_image, use_container_width=True)
+        if st.button("Fermer la vue"):
+            st.session_state.selected_image = None
+
+    st.table(df_export)
