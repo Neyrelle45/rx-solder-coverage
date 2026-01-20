@@ -78,7 +78,14 @@ def load_gray(path: str) -> np.ndarray:
     # ==========================================
 
     return img
-    
+
+def compute_confidence(clf, features):
+    """Calcule le score de confiance moyen basé sur les probabilités de l'IA"""
+    probs = clf.predict_proba(features)
+    # On prend la probabilité max pour chaque pixel (la certitude du choix)
+    max_probs = np.max(probs, axis=1)
+    return np.mean(max_probs)
+
 def apply_clahe(img: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8)) -> np.ndarray:
     return cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size).apply(img)
 
@@ -772,4 +779,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
