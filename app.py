@@ -5,10 +5,12 @@ import pandas as pd
 import joblib
 import io
 import zipfile
+import datetime
 import analyse_rx_soudure as engine 
 
 st.set_page_config(page_title="Station Analyse RX - Expert Voids", layout="wide")
 
+# Initialisation du stockage en session
 if 'history' not in st.session_state:
     st.session_state.history = []
 if 'selected_image' not in st.session_state:
@@ -33,6 +35,7 @@ if model_file:
         mask_upload = st.file_uploader("2. Masque (Vert/Noir)", type=["png", "jpg"])
 
     if rx_upload and mask_upload:
+        # --- CHARGEMENT ---
         img_gray = engine.load_gray(rx_upload, contrast_limit=contrast_val)
         H, W = img_gray.shape
 
@@ -63,7 +66,7 @@ if model_file:
         envelope_adj = cv2.warpAffine(mask_green_raw, M, (W, H), flags=cv2.INTER_NEAREST)
         holes_adj = cv2.warpAffine(mask_black_raw, M, (W, H), flags=cv2.INTER_NEAREST)
 
-        with st.spinner("Analyse..."):
+        with st.spinner("Analyse IA..."):
             features = engine.compute_features(img_gray)
             pred_map = clf.predict(features.reshape(-1, 3)).reshape(H, W)
 
@@ -77,15 +80,21 @@ if model_file:
         cnts, _ = cv2.findContours(void_mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         internal_voids = []
         for c in cnts:
-            if cv2.contourArea(c) < 3.0: continue
+            area = cv2.contourArea(c)
+            if area < 3.0: continue
+            
             c_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(c_mask, [c], -1, 255, -1) 
+            
+            # FILTRES : Pas de trou noir dedans ET ne touche pas le bord externe
             contains_via = np.any((c_mask > 0) & (holes_adj > 0))
             border_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(border_mask, [c], -1, 255, 1)
-            touches_edge = np.any((cv2.dilate(border_mask, np.ones((3,3))) > 0) & (envelope_adj == 0))
+            dilated = cv2.dilate(border_mask, np.ones((3,3)))
+            touches_edge = np.any((dilated > 0) & (envelope_adj == 0))
+            
             if not touches_edge and not contains_via:
-                internal_voids.append({'area': cv2.contourArea(c), 'poly': c})
+                internal_voids.append({'area': area, 'poly': c})
         
         top_5 = sorted(internal_voids, key=lambda x: x['area'], reverse=True)[:5]
 
@@ -96,10 +105,12 @@ if model_file:
         for v in top_5:
             cv2.drawContours(overlay, [v['poly']], -1, [0, 255, 255], 2)
 
+        # --- RÉSULTATS & ARCHIVAGE ---
         st.divider()
         c_res, c_img = st.columns([1, 2])
         with c_res:
             st.metric("Manque Total", f"{missing_pct:.2f} %")
             void_stats = {}
             for i in range(5):
-                v_pct = (top_
+                # Calcul sécurisé du pourcentage par void
+                v_pct = (top_5[i]['area']
