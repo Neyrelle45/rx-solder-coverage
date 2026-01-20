@@ -5,21 +5,35 @@ import pandas as pd
 import joblib
 import analyse_rx_soudure as engine
 import os
+from PIL import Image
 
-st.set_page_config(page_title="Contrôle Qualité RX - Voids", layout="wide")
+st.set_page_config(page_title="Station Analyse RX", layout="wide")
 
+# --- Initialisation de l'historique (Session State) ---
+if 'history_df' not in st.session_state:
+    st.session_state.history_df = pd.DataFrame(columns=[
+        "Fichier", "Manque Global %", "Void 1 %", "Void 2 %", "Void 3 %", "Void 4 %", "Void 5 %"
+    ])
+if 'analyzed_images' not in st.session_state:
+    st.session_state.analyzed_images = {} # Stockage des images traitées {nom: image_rgb}
+
+# --- Cache Modèle ---
 @st.cache_resource
 def load_trained_model(file_upload):
     with open("temp_model.joblib", "wb") as f:
         f.write(file_upload.getbuffer())
     return joblib.load("temp_model.joblib")
 
+# --- Sidebar ---
 st.sidebar.title("🔍 Configuration")
-model_file = st.sidebar.file_uploader("Modèle (.joblib)", type=["joblib"])
+st.sidebar.info("📂 Dossier de travail :\n`C:\\Users\\kiefferp\\OneDrive - ALL Circuits\\Bureau\\WIP\\_IA\\Analyse RX`")
+
+model_file = st.sidebar.file_uploader("1. Charger le modèle", type=["joblib"])
 
 if model_file:
     clf = load_trained_model(model_file)
-    st.header("🎯 Analyse Précise du Top 5 Voids")
+    
+    st.header("🎯 Analyse et Historique")
     
     col_u1, col_u2 = st.columns(2)
     with col_u1:
@@ -28,13 +42,14 @@ if model_file:
         mask_upload = st.file_uploader("Masque d'inspection", type=["png", "jpg", "jpeg"])
 
     if rx_upload and mask_upload:
+        # Traitement
         with open("temp_rx.png", "wb") as f: f.write(rx_upload.getbuffer())
         with open("temp_mask.png", "wb") as f: f.write(mask_upload.getbuffer())
 
         img_gray = engine.load_gray("temp_rx.png")
         H, W = img_gray.shape
 
-        # --- Sidebar Alignement ---
+        # Sidebar Ajustements
         st.sidebar.subheader("🕹️ Ajustement")
         tx = st.sidebar.number_input("X (px)", value=0.0, step=1.0)
         ty = st.sidebar.number_input("Y (px)", value=0.0, step=1.0)
@@ -50,76 +65,82 @@ if model_file:
         M = engine.compose_similarity(scale, rot, tx, ty, cx, cy)
         zone_adj = cv2.warpAffine(zone_base, M, (W, H), flags=cv2.INTER_NEAREST)
 
-        with st.spinner("Analyse IA en cours..."):
+        with st.spinner("Analyse..."):
             feats = engine.compute_features(img_gray)
             pred = clf.predict(feats.reshape(-1, feats.shape[-1])).reshape(H, W)
             pred_bin = (pred == 1).astype(np.uint8) * 255 
 
-        # --- DÉTECTION DES VOIDS (Holes in solder) ---
+        # Détection Voids
         solder_map = np.zeros((H,W), dtype=np.uint8)
         solder_map[(zone_adj > 0) & (pred_bin > 0)] = 255
-        
-        # RETR_CCOMP pour isoler les trous internes à la soudure
         contours, hierarchy = cv2.findContours(solder_map, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         
         voids_all = []
         if hierarchy is not None:
             for i, h in enumerate(hierarchy[0]):
-                if h[3] != -1: # Uniquement les trous internes
+                if h[3] != -1:
                     cnt = contours[i]
                     area = cv2.contourArea(cnt)
-                    if area > 2: # Seuil minimum pour filtrer le bruit
-                        voids_all.append({"area": area, "contour": cnt})
-
-        # TRI ET LIMITATION AU TOP 5
-        voids_top5 = sorted(voids_all, key=lambda x: x['area'], reverse=True)[:5]
-
-        # --- VISUALISATION ---
+                    if area > 2:
+                        voids_all.append(area)
+                        # On ne garde le contour que pour l'affichage (logic simplifiée ici)
+        
+        voids_sorted = sorted(voids_all, reverse=True)
+        top_5_voids = voids_sorted[:5]
+        
+        # Calculs
+        total_px = int(np.sum(zone_adj > 0))
+        solder_px = int(np.sum((pred_bin > 0) & (zone_adj > 0)))
+        missing_pct = ((total_px - solder_px) / total_px * 100) if total_px > 0 else 0
+        
+        # Préparation image résultat
         overlay_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay_rgb[zone_adj > 0] = [255, 0, 0] # Rouge (Manque)
-        overlay_rgb[(zone_adj > 0) & (pred_bin > 0)] = [255, 255, 0] # Jaune (Soudure)
+        overlay_rgb[zone_adj > 0] = [255, 0, 0] # Rouge
+        overlay_rgb[(zone_adj > 0) & (pred_bin > 0)] = [255, 255, 0] # Jaune
+        
+        # Cerclage Top 5 sur l'image (refait les contours pour le dessin)
+        # (On ré-extrait pour dessiner uniquement les 5 plus gros)
+        voids_contours = []
+        if hierarchy is not None:
+            for i, h in enumerate(hierarchy[0]):
+                if h[3] != -1:
+                    voids_contours.append(contours[i])
+        voids_contours = sorted(voids_contours, key=cv2.contourArea, reverse=True)[:5]
+        for c in voids_contours:
+            cv2.drawContours(overlay_rgb, [c], -1, [0, 255, 255], 2)
 
-        # CERCLAGE CYAN (Épaisseur 2 et limite stricte aux 5 plus gros)
-        for v in voids_top5:
-            cv2.drawContours(overlay_rgb, [v['contour']], -1, [0, 255, 255], 2)
+        # Affichage image actuelle
+        st.image(overlay_rgb, caption=f"Analyse : {rx_upload.name}", use_container_width=True)
 
-        # --- AFFICHAGE ET TABLEAUX ---
-        st.divider()
-        res_col1, res_col2 = st.columns([2, 1])
-
-        with res_col1:
-            st.image(overlay_rgb, caption="Top 5 Voids Identifiés (Cerclage Cyan)", use_container_width=True)
+        # --- Bouton d'enregistrement dans l'historique ---
+        if st.button("📥 Enregistrer ce résultat dans l'historique"):
+            new_row = {
+                "Fichier": rx_upload.name,
+                "Manque Global %": round(missing_pct, 2)
+            }
+            for i in range(5):
+                val = (top_5_voids[i] / total_px * 100) if i < len(top_5_voids) else 0
+                new_row[f"Void {i+1} %"] = round(val, 2)
             
-            # Bouton de téléchargement
-            result_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
-            _, buffer = cv2.imencode('.png', result_bgr)
-            st.download_button("💾 Télécharger l'image", buffer.tobytes(), f"analyse_top5_{rx_upload.name}")
+            # Mise à jour DataFrame et Galerie
+            st.session_state.history_df = pd.concat([st.session_state.history_df, pd.DataFrame([new_row])], ignore_index=True)
+            st.session_state.analyzed_images[rx_upload.name] = overlay_rgb
+            st.success("Résultat ajouté au tableau.")
 
-        with res_col2:
-            total_px = int(np.sum(zone_adj > 0))
-            solder_px = int(np.sum((pred_bin > 0) & (zone_adj > 0)))
-            missing_px = total_px - solder_px
-            
-            st.subheader("📊 Taux Global")
-            st.table(pd.DataFrame({
-                "Métriques": ["Surface Totale", "Soudure Réelle", "Manque Global"],
-                "Pixels": [total_px, solder_px, missing_px]
-            }))
-            st.metric("Taux de Manque Total", f"{(missing_px/total_px*100):.2f} %")
+    # --- TABLEAU RECAPITULATIF (Bas de page) ---
+    st.divider()
+    st.subheader("📊 Historique des analyses")
+    st.dataframe(st.session_state.history_df, use_container_width=True)
 
-            st.divider()
-            st.subheader("🔝 Top 5 Voids (Détails)")
-            if voids_top5:
-                v_list = []
-                for i, v in enumerate(voids_top5):
-                    v_pct = (v['area'] / total_px * 100)
-                    v_list.append({
-                        "Rang": i+1, 
-                        "Surface (px)": int(v['area']), 
-                        "% de la Zone": f"{v_pct:.2f} %"
-                    })
-                st.table(pd.DataFrame(v_list))
-            else:
-                st.info("Aucun void détecté.")
+    # --- GALERIE DE VIGNETTES ---
+    st.subheader("🖼️ Galerie des inspections (cliquer pour agrandir)")
+    if st.session_state.analyzed_images:
+        cols = st.columns(5) # 5 vignettes par ligne
+        for idx, (name, img) in enumerate(st.session_state.analyzed_images.items()):
+            with cols[idx % 5]:
+                st.image(img, caption=name, use_container_width=True)
+                if st.button("Voir", key=f"btn_{name}"):
+                    st.image(img, caption=f"Zoom sur {name}", use_container_width=True)
+    
 else:
-    st.info("Veuillez charger votre modèle .joblib.")
+    st.info("Veuillez charger votre modèle .joblib pour commencer.")
