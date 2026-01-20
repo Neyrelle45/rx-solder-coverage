@@ -34,7 +34,7 @@ if model_file:
     clf = joblib.load(model_file)
     st.sidebar.success("Modèle opérationnel")
 
-    st.header("🔍 Analyse de Soudure")
+    st.header("🔍 Analyse de Soudure & Indice de Confiance")
     
     col_u, col_m = st.columns(2)
     with col_u:
@@ -57,7 +57,7 @@ if model_file:
         with open("temp_app_mask.png", "wb") as f:
             f.write(mask_upload.getbuffer())
         
-        # Extraction masques via ton moteur
+        # Extraction masques
         insp = cv2.imread("temp_app_mask.png", cv2.IMREAD_COLOR)
         b_c, g_c, r_c = cv2.split(insp)
         mask_green_raw = (g_c > 100).astype(np.uint8) 
@@ -74,19 +74,28 @@ if model_file:
         envelope_adj = cv2.warpAffine(mask_green_raw, M, (W, H), flags=cv2.INTER_NEAREST)
         holes_adj = cv2.warpAffine(mask_black_raw, M, (W, H), flags=cv2.INTER_NEAREST)
 
-        # --- ANALYSE IA (CORRECTED) ---
-        with st.spinner("Analyse IA en cours..."):
+        # --- ANALYSE IA AVEC PROBABILITÉS ---
+        with st.spinner("Analyse IA et calcul de confiance..."):
             features = engine.compute_features(img_gray)
-            
-            # Correction Dynamique de la dimension
             n_features = features.shape[-1] 
             flat_features = features.reshape(-1, n_features)
             
             try:
-                pred_flat = clf.predict(flat_features)
+                # Calcul des probabilités pour chaque classe
+                probs = clf.predict_proba(flat_features) 
+                # La prédiction finale reste la classe avec la proba max
+                pred_flat = np.argmax(probs, axis=1)
                 pred_map = pred_flat.reshape(H, W)
-            except ValueError as e:
-                st.error(f"Erreur de dimension IA : Votre modèle attend peut-être un nombre de filtres différent. (Détail: {e})")
+                
+                # Calcul de la confiance : probabilité de la classe choisie
+                conf_flat = np.max(probs, axis=1)
+                conf_map = conf_flat.reshape(H, W)
+                
+                # Confiance moyenne uniquement sur la zone utile
+                mean_conf = np.mean(conf_map[zone_adj > 0]) * 100 if np.any(zone_adj > 0) else 0
+                
+            except (ValueError, AttributeError) as e:
+                st.error(f"Le modèle ne supporte pas predict_proba ou les dimensions divergent: {e}")
                 st.stop()
 
         # --- FILTRAGE VOIDS ---
@@ -101,15 +110,12 @@ if model_file:
         for c in cnts:
             area = cv2.contourArea(c)
             if area < 3.0: continue
-            
             c_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(c_mask, [c], -1, 255, -1) 
-            
             contains_via = np.any((c_mask > 0) & (holes_adj > 0))
             border_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(border_mask, [c], -1, 255, 1)
-            dilated = cv2.dilate(border_mask, np.ones((3,3)))
-            touches_edge = np.any((dilated > 0) & (envelope_adj == 0))
+            touches_edge = np.any((cv2.dilate(border_mask, np.ones((3,3))) > 0) & (envelope_adj == 0))
             
             if not touches_edge and not contains_via:
                 internal_voids.append({'area': area, 'poly': c})
@@ -128,6 +134,12 @@ if model_file:
         c_res, c_img = st.columns([1, 2])
         with c_res:
             st.metric("Manque Total", f"{missing_pct:.2f} %")
+            
+            # Affichage du taux de confiance avec couleur dynamique
+            color_conf = "inverse" if mean_conf < 85 else "normal"
+            st.metric("Indice de Confiance IA", f"{mean_conf:.1f} %", delta=f"{mean_conf-100:.1f}%", delta_color=color_conf)
+            
+            st.write("📏 **Top 5 Voids (Bulles Internes)**")
             void_stats = {}
             for i in range(5):
                 v_pct = (top_5[i]['area'] / area_total_px * 100) if i < len(top_5) else 0.0
@@ -137,7 +149,8 @@ if model_file:
             if st.button("📥 Archiver l'analyse"):
                 entry = {
                     "Fichier": rx_upload.name, 
-                    "Total_%": round(missing_pct, 2), 
+                    "Total_%": round(missing_pct, 2),
+                    "Confiance_%": round(mean_conf, 2),
                     "image": overlay.copy(),
                     "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
@@ -153,7 +166,6 @@ if st.session_state.history:
     st.divider()
     st.subheader("📊 Rapport de Session")
 
-    # Préparation du ZIP
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     zip_buffer = io.BytesIO()
     
@@ -163,18 +175,10 @@ if st.session_state.history:
         for idx, item in enumerate(st.session_state.history):
             img_bgr = cv2.cvtColor(item['image'], cv2.COLOR_RGB2BGR)
             _, img_encoded = cv2.imencode(".png", img_bgr)
-            clean_name = item['Fichier'].split('.')[0]
-            z.writestr(f"images/{idx+1}_{clean_name}.png", img_encoded.tobytes())
+            z.writestr(f"images/{idx+1}_{item['Fichier'].split('.')[0]}.png", img_encoded.tobytes())
 
-    st.download_button(
-        label="🎁 Télécharger le Pack Complet (.zip)",
-        data=zip_buffer.getvalue(),
-        file_name=f"export_{timestamp}.zip",
-        mime="application/zip",
-        use_container_width=True
-    )
+    st.download_button("🎁 Télécharger le Pack Complet (.zip)", zip_buffer.getvalue(), f"export_{timestamp}.zip", "application/zip", use_container_width=True)
 
-    # Galerie miniatures
     cols = st.columns(6)
     for idx, item in enumerate(st.session_state.history):
         with cols[idx % 6]:
@@ -183,9 +187,7 @@ if st.session_state.history:
                 st.session_state.selected_image = item['image']
             st.image(thumb, use_container_width=True)
 
-    # Vue détaillée
     if st.session_state.selected_image is not None:
-        st.markdown("### 🖼️ Vue détaillée")
         st.image(st.session_state.selected_image, use_container_width=True)
         if st.button("Fermer la vue"): st.session_state.selected_image = None
 
