@@ -43,48 +43,49 @@ def list_images(d: str):
         [os.path.join(d, n) for n in os.listdir(d) if n.lower().endswith(VALID_EXTS)]
     )
 
-def load_gray(path: str) -> np.ndarray:
-    # 1. Lecture de l'image (Gestion du cas Streamlit ou chemin disque)
+def load_gray(path, contrast_limit=2.0) -> np.ndarray:
+    """
+    Charge une image et applique un contraste adaptatif (CLAHE).
+    """
+    # Gestion du flux Streamlit ou du chemin texte
     if hasattr(path, 'read'):
         file_bytes = np.asarray(bytearray(path.read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
+        path.seek(0) # Important pour Streamlit
     else:
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
 
     if img is None:
-        raise FileNotFoundError(str(path))
+        return None
 
-    # 2. Conversion en niveaux de gris si nécessaire
+    # Conversion en gris si nécessaire
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 3. Normalisation des formats (16-bit vers 8-bit)
+    # Passage en 8 bits
     if img.dtype == np.uint16:
         mn, mx = int(img.min()), int(img.max())
-        if mx == mn:
-            img = np.zeros_like(img, dtype=np.uint8)
-        else:
-            img = ((img.astype(np.float32) - mn) / (mx - mn) * 255.0).astype(np.uint8)
+        img = ((img.astype(np.float32) - mn) / (mx - mn + 1e-5) * 255.0).astype(np.uint8)
     elif img.dtype != np.uint8:
         img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    # ==========================================
-    # PATCH : AMÉLIORATION DU CONTRASTE (CLAHE)
-    # ==========================================
-    # On crée l'égaliseur de contraste adaptatif
-    # clipLimit=2.0 évite d'amplifier trop le bruit numérique
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    img = clahe.apply(img)
-    # ==========================================
-
+    # --- LE PATCH CONTRASTE RÉGLABLE ---
+    if contrast_limit > 0:
+        clahe = cv2.createCLAHE(clipLimit=contrast_limit, tileGridSize=(8,8))
+        img = clahe.apply(img)
+    
     return img
 
 def compute_confidence(clf, features):
-    """Calcule le score de confiance moyen basé sur les probabilités de l'IA"""
+    """Calcule le score de confiance basé sur les probabilités de l'IA"""
+    # Récupère les probabilités pour chaque classe (Soudure vs Fond)
     probs = clf.predict_proba(features)
-    # On prend la probabilité max pour chaque pixel (la certitude du choix)
+    # On prend la probabilité la plus haute pour chaque pixel
     max_probs = np.max(probs, axis=1)
+    # Retourne la moyenne de certitude sur toute l'image
     return np.mean(max_probs)
+
+
 
 def apply_clahe(img: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8)) -> np.ndarray:
     return cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size).apply(img)
