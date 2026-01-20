@@ -18,6 +18,14 @@ if 'selected_image' not in st.session_state:
 
 st.sidebar.title("🛠️ Configuration")
 
+# BOUTON DE VIDAGE (Reset)
+if st.sidebar.button("🗑️ Effacer l'historique session", use_container_width=True):
+    st.session_state.history = []
+    st.session_state.selected_image = None
+    st.rerun()
+
+st.sidebar.divider()
+
 # 1. RÉGLAGES IMAGE & IA
 contrast_val = st.sidebar.slider("Contraste (CLAHE)", 0.0, 10.0, 2.0, 0.5)
 model_file = st.sidebar.file_uploader("Charger modèle (.joblib)", type=["joblib"])
@@ -39,7 +47,7 @@ if model_file:
         img_gray = engine.load_gray(rx_upload, contrast_limit=contrast_val)
         H, W = img_gray.shape
 
-        # --- ALIGNEMENT DU MASQUE (PAS DE 1) ---
+        # --- ALIGNEMENT DU MASQUE ---
         st.sidebar.subheader("🕹️ Alignement manuel")
         tx = st.sidebar.number_input("Translation X (px)", value=0, step=1)
         ty = st.sidebar.number_input("Translation Y (px)", value=0, step=1)
@@ -49,7 +57,7 @@ if model_file:
         with open("temp_app_mask.png", "wb") as f:
             f.write(mask_upload.getbuffer())
         
-        # Extraction masques
+        # Extraction masques via ton moteur
         insp = cv2.imread("temp_app_mask.png", cv2.IMREAD_COLOR)
         b_c, g_c, r_c = cv2.split(insp)
         mask_green_raw = (g_c > 100).astype(np.uint8) 
@@ -66,9 +74,20 @@ if model_file:
         envelope_adj = cv2.warpAffine(mask_green_raw, M, (W, H), flags=cv2.INTER_NEAREST)
         holes_adj = cv2.warpAffine(mask_black_raw, M, (W, H), flags=cv2.INTER_NEAREST)
 
-        with st.spinner("Analyse IA..."):
+        # --- ANALYSE IA (CORRECTED) ---
+        with st.spinner("Analyse IA en cours..."):
             features = engine.compute_features(img_gray)
-            pred_map = clf.predict(features.reshape(-1, 3)).reshape(H, W)
+            
+            # Correction Dynamique de la dimension
+            n_features = features.shape[-1] 
+            flat_features = features.reshape(-1, n_features)
+            
+            try:
+                pred_flat = clf.predict(flat_features)
+                pred_map = pred_flat.reshape(H, W)
+            except ValueError as e:
+                st.error(f"Erreur de dimension IA : Votre modèle attend peut-être un nombre de filtres différent. (Détail: {e})")
+                st.stop()
 
         # --- FILTRAGE VOIDS ---
         valid_solder = (pred_map == 1) & (zone_adj > 0)
@@ -86,7 +105,6 @@ if model_file:
             c_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(c_mask, [c], -1, 255, -1) 
             
-            # FILTRES : Pas de trou noir dedans ET ne touche pas le bord externe
             contains_via = np.any((c_mask > 0) & (holes_adj > 0))
             border_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(border_mask, [c], -1, 255, 1)
@@ -112,7 +130,6 @@ if model_file:
             st.metric("Manque Total", f"{missing_pct:.2f} %")
             void_stats = {}
             for i in range(5):
-                # Calcul sécurisé du pourcentage par void
                 v_pct = (top_5[i]['area'] / area_total_px * 100) if i < len(top_5) else 0.0
                 st.write(f"Void {i+1} : {v_pct:.3f} %")
                 void_stats[f"V{i+1}"] = round(v_pct, 3)
@@ -126,10 +143,10 @@ if model_file:
                 }
                 entry.update(void_stats)
                 st.session_state.history.append(entry)
-                st.success("Archivé dans la session !")
+                st.success("Archivé !")
 
         with c_img:
-            st.image(overlay, caption="Analyse active (Jaune: OK, Rouge: Manque, Cyan: Voids)", use_container_width=True)
+            st.image(overlay, caption="Analyse active (Jaune: OK, Cyan: Voids)", use_container_width=True)
 
 # --- SECTION RAPPORT ET EXPORT ---
 if st.session_state.history:
@@ -141,25 +158,23 @@ if st.session_state.history:
     zip_buffer = io.BytesIO()
     
     with zipfile.ZipFile(zip_buffer, "w") as z:
-        # CSV (on retire l'objet image pour le tableau)
         df_export = pd.DataFrame(st.session_state.history).drop(columns=['image'])
         z.writestr(f"rapport_{timestamp}.csv", df_export.to_csv(index=False))
-        
-        # Images
         for idx, item in enumerate(st.session_state.history):
             img_bgr = cv2.cvtColor(item['image'], cv2.COLOR_RGB2BGR)
             _, img_encoded = cv2.imencode(".png", img_bgr)
             clean_name = item['Fichier'].split('.')[0]
-            z.writestr(f"images/{idx+1}_{clean_name}_analyse.png", img_encoded.tobytes())
+            z.writestr(f"images/{idx+1}_{clean_name}.png", img_encoded.tobytes())
 
     st.download_button(
         label="🎁 Télécharger le Pack Complet (.zip)",
         data=zip_buffer.getvalue(),
-        file_name=f"export_session_{timestamp}.zip",
-        mime="application/zip"
+        file_name=f"export_{timestamp}.zip",
+        mime="application/zip",
+        use_container_width=True
     )
 
-    # Galerie miniatures cliquables
+    # Galerie miniatures
     cols = st.columns(6)
     for idx, item in enumerate(st.session_state.history):
         with cols[idx % 6]:
@@ -172,7 +187,6 @@ if st.session_state.history:
     if st.session_state.selected_image is not None:
         st.markdown("### 🖼️ Vue détaillée")
         st.image(st.session_state.selected_image, use_container_width=True)
-        if st.button("Fermer la vue"):
-            st.session_state.selected_image = None
+        if st.button("Fermer la vue"): st.session_state.selected_image = None
 
     st.table(df_export)
