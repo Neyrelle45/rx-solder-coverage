@@ -19,7 +19,8 @@ if 'selected_img' not in st.session_state:
 
 def highlight_extremes(s):
     if len(s) < 2: return [''] * len(s)
-    is_max = s == s.max(); is_min = s == s.min()
+    is_max = s == s.max()
+    is_min = s == s.min()
     return ['background-color: #ffcccc' if v else 'background-color: #ccf2ff' if m else '' for v, m in zip(is_max, is_min)]
 
 st.sidebar.title("🛠️ Configuration")
@@ -60,11 +61,14 @@ if model_file:
         hol_adj = cv2.warpAffine(m_black_res, M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj & ~hol_adj)
 
-        # Analyse IA
+        # --- ANALYSE IA ---
         features = engine.compute_features(img_gray)
         probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
         pred_map = np.argmax(probs, axis=1).reshape(H, W)
-        mean_conf = np.mean(np.max(probs, axis=1)[z_utile > 0]) * 100 if np.any(z_utile) else 0
+        
+        # FIX ERREUR : Reshape du tableau de confiance pour correspondre au masque
+        conf_map = np.max(probs, axis=1).reshape(H, W)
+        mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
         # Identification Soudure et Manques
         valid_solder = (pred_map == 1) & (z_utile > 0)
@@ -72,8 +76,7 @@ if model_file:
         area_total_px = np.sum(z_utile > 0)
         missing_pct = (1.0 - (np.sum(valid_solder) / area_total_px)) * 100.0 if area_total_px > 0 else 0
 
-        # --- NOUVELLE LOGIQUE VOID MAJEUR ---
-        # On cherche les formes rouges (manque) dans la zone d'inspection
+        # --- LOGIQUE VOID MAJEUR (STRICTE) ---
         v_mask_u8 = (valid_voids.astype(np.uint8)) * 255
         cnts, _ = cv2.findContours(v_mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
@@ -82,7 +85,7 @@ if model_file:
 
         for c in cnts:
             area = cv2.contourArea(c)
-            if area < 10.0: continue # Filtre bruit
+            if area < 10.0: continue 
             
             c_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(c_mask, [c], -1, 255, -1)
@@ -91,7 +94,6 @@ if model_file:
             if np.any((c_mask > 0) & (hol_adj > 0)): continue
             
             # 2. Doit être à l'intérieur du masque (ne pas toucher l'extérieur vert)
-            # On vérifie que le contour est bien "inscrit" dans env_adj
             border = cv2.dilate(c_mask, np.ones((3,3), np.uint8)) - c_mask
             if np.any((border > 0) & (env_adj == 0)): continue
 
@@ -101,24 +103,26 @@ if model_file:
 
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # Overlay & Galerie
+        # Overlay
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[valid_solder] = [255, 255, 0]
-        overlay[valid_voids] = [255, 0, 0]
+        overlay[valid_solder] = [255, 255, 0] # Jaune
+        overlay[valid_voids] = [255, 0, 0]    # Rouge
         if max_void_poly is not None:
-            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
+            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3) # Cyan
 
+        # Affichage
         st.divider()
         c_res, c_img = st.columns([1, 2])
         with c_res:
             st.metric("Manque Total", f"{missing_pct:.2f} %")
             st.metric("Void Majeur", f"{max_void_pct:.3f} %")
+            st.metric("Confiance IA", f"{mean_conf:.1f} %")
             if st.button("📥 Archiver", use_container_width=True):
                 _, img_jpg = cv2.imencode(".jpg", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
                 st.session_state.history.append({
                     "Fichier": rx_upload.name, "Total_%": round(missing_pct, 2),
                     "Void_Max_%": round(max_void_pct, 3), "Confiance_%": round(mean_conf, 1),
-                    "img_bytes": img_jpg.tobytes()
+                    "img_bytes": img_jpg.tobytes(), "Heure": datetime.datetime.now().strftime("%H:%M:%S")
                 }); st.toast("Archivé")
         with c_img: st.image(overlay, use_container_width=True)
 
@@ -141,7 +145,7 @@ if st.session_state.history:
     for idx, item in enumerate(st.session_state.history):
         with cols[idx % 6]:
             if st.button(f"🔎 Zoom {idx+1}", key=f"btn_{idx}"): st.session_state.selected_img = item['img_bytes']
-            st.image(item['img_bytes'])
+            st.image(item['img_bytes'], caption=f"{item['Total_%']}%")
 
     if st.session_state.selected_img:
         st.divider(); st.image(st.session_state.selected_img, use_container_width=True)
