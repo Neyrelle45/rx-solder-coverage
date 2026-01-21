@@ -9,7 +9,7 @@ import datetime
 import gc
 import analyse_rx_soudure as engine 
 
-st.set_page_config(page_title="RX Expert - Analyse du Void Majeur", layout="wide")
+st.set_page_config(page_title="RX Expert - Void Majeur Enclavé", layout="wide")
 
 # --- INITIALISATION ---
 if 'history' not in st.session_state:
@@ -19,8 +19,7 @@ if 'selected_img' not in st.session_state:
 
 def highlight_extremes(s):
     if len(s) < 2: return [''] * len(s)
-    is_max = s == s.max()
-    is_min = s == s.min()
+    is_max = s == s.max(); is_min = s == s.min()
     return ['background-color: #ffcccc' if v else 'background-color: #ccf2ff' if m else '' for v, m in zip(is_max, is_min)]
 
 st.sidebar.title("🛠️ Configuration")
@@ -35,7 +34,7 @@ if model_file:
     def load_my_model(file): return joblib.load(file)
     clf = load_my_model(model_file)
 
-    st.header("🔍 Analyse du Void Maximum")
+    st.header("🔍 Analyse du Void Majeur (Soudure Uniquement)")
     c_u, c_m = st.columns(2)
     with c_u: rx_upload = st.file_uploader("1. Image RX", type=["png", "jpg", "jpeg", "tif"])
     with c_m: mask_upload = st.file_uploader("2. Masque (Vert/Noir)", type=["png", "jpg"])
@@ -61,61 +60,69 @@ if model_file:
         hol_adj = cv2.warpAffine(m_black_res, M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj & ~hol_adj)
 
-        # --- ANALYSE IA ---
+        # Analyse IA
         features = engine.compute_features(img_gray)
         probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
         pred_map = np.argmax(probs, axis=1).reshape(H, W)
-        
-        # FIX ERREUR : Reshape du tableau de confiance pour correspondre au masque
         conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-        # Identification Soudure et Manques
+        # Identification Zones
         valid_solder = (pred_map == 1) & (z_utile > 0)
         valid_voids = (pred_map == 0) & (z_utile > 0)
         area_total_px = np.sum(z_utile > 0)
         missing_pct = (1.0 - (np.sum(valid_solder) / area_total_px)) * 100.0 if area_total_px > 0 else 0
 
-        # --- LOGIQUE VOID MAJEUR (STRICTE) ---
-        v_mask_u8 = (valid_voids.astype(np.uint8)) * 255
-        cnts, _ = cv2.findContours(v_mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+        # --- LOGIQUE : VOID MAJEUR ENCLAVÉ DANS LE JAUNE ---
         max_void_area = 0
         max_void_poly = None
 
-        for c in cnts:
-            area = cv2.contourArea(c)
-            if area < 10.0: continue 
-            
-            c_mask = np.zeros((H, W), dtype=np.uint8)
-            cv2.drawContours(c_mask, [c], -1, 255, -1)
-            
-            # 1. Ne doit pas toucher un via (noir)
-            if np.any((c_mask > 0) & (hol_adj > 0)): continue
-            
-            # 2. Doit être à l'intérieur du masque (ne pas toucher l'extérieur vert)
-            border = cv2.dilate(c_mask, np.ones((3,3), np.uint8)) - c_mask
-            if np.any((border > 0) & (env_adj == 0)): continue
+        # 1. On trouve les contours des zones de soudure (jaunes)
+        solder_u8 = valid_solder.astype(np.uint8) * 255
+        solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            if area > max_void_area:
-                max_void_area = area
-                max_void_poly = c
+        for s_cnt in solder_cnts:
+            # Pour chaque îlot de soudure, on crée un masque
+            s_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
+            
+            # 2. On cherche les "trous" à l'intérieur de cet îlot
+            # Un trou est une zone qui n'est pas de la soudure MAIS qui est dans le périmètre de l'îlot
+            inverted_s_mask = cv2.bitwise_not(solder_u8)
+            holes_in_island = cv2.bitwise_and(s_mask, inverted_s_mask)
+            
+            h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for h_cnt in h_cnts:
+                area = cv2.contourArea(h_cnt)
+                if area < 10.0: continue
+                
+                h_mask = np.zeros((H, W), dtype=np.uint8)
+                cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
+                
+                # CRITÈRE D'EXCLUSION : Ne doit pas contenir de zone noire (via/non inspecté)
+                if np.any((h_mask > 0) & (hol_adj > 0)):
+                    continue
+                
+                if area > max_void_area:
+                    max_void_area = area
+                    max_void_poly = h_cnt
 
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
         # Overlay
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[valid_solder] = [255, 255, 0] # Jaune
-        overlay[valid_voids] = [255, 0, 0]    # Rouge
+        overlay[valid_solder] = [255, 255, 0]
+        overlay[valid_voids] = [255, 0, 0]
         if max_void_poly is not None:
-            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3) # Cyan
+            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
-        # Affichage
+        # Affichage et Archivage
         st.divider()
         c_res, c_img = st.columns([1, 2])
         with c_res:
             st.metric("Manque Total", f"{missing_pct:.2f} %")
-            st.metric("Void Majeur", f"{max_void_pct:.3f} %")
+            st.metric("Void Majeur (Enclavé)", f"{max_void_pct:.3f} %")
             st.metric("Confiance IA", f"{mean_conf:.1f} %")
             if st.button("📥 Archiver", use_container_width=True):
                 _, img_jpg = cv2.imencode(".jpg", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
@@ -126,7 +133,7 @@ if model_file:
                 }); st.toast("Archivé")
         with c_img: st.image(overlay, use_container_width=True)
 
-# --- RAPPORT, ZIP ET GALERIE ---
+# --- RAPPORT, ZIP ET GALERIE (FONCTIONS RESTAURÉES) ---
 if st.session_state.history:
     st.divider()
     df_full = pd.DataFrame(st.session_state.history)
@@ -149,4 +156,4 @@ if st.session_state.history:
 
     if st.session_state.selected_img:
         st.divider(); st.image(st.session_state.selected_img, use_container_width=True)
-        if st.button("❌ Fermer"): st.session_state.selected_img = None; st.rerun()
+        if st.button("❌ Fermer le zoom"): st.session_state.selected_img = None; st.rerun()
