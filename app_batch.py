@@ -17,10 +17,11 @@ if 'batch_history' not in st.session_state:
 
 st.sidebar.title("🚀 Mode Batch (Fixe)")
 
-# BOUTON RESET
-if st.sidebar.button("🗑️ Vider la session actuelle", use_container_width=True):
+# --- BOUTON RESET CORRIGÉ (SANS RERUN) ---
+if st.sidebar.button("🗑️ Vider les résultats", use_container_width=True):
     st.session_state.batch_history = []
-    st.rerun()
+    # On utilise st.toast pour confirmer sans rafraîchir toute la page
+    st.sidebar.success("Résultats effacés !")
 
 st.sidebar.divider()
 
@@ -28,6 +29,8 @@ st.sidebar.divider()
 contrast_val = st.sidebar.slider("Contraste (appliqué à tous)", 0.0, 10.0, 2.0, 0.5)
 model_file = st.sidebar.file_uploader("1. Charger modèle (.joblib)", type=["joblib"])
 
+# On sort les composants de chargement du bloc conditionnel "if st.button" 
+# mais on les garde dans "if model_file" car ils en dépendent.
 if model_file:
     @st.cache_resource
     def load_my_model(file):
@@ -48,19 +51,19 @@ if model_file:
 
     with col_f:
         st.subheader("Images à analyser")
-        # --- SÉLECTION MULTIPLE ACTIVÉE ---
         rx_uploads = st.file_uploader(
-            "3. Sélectionner les images RX (Maintenir Ctrl pour plusieurs)", 
+            "3. Sélectionner les images RX", 
             type=["png", "jpg", "jpeg", "tif"], 
             accept_multiple_files=True
         )
         if rx_uploads:
             st.info(f"📁 {len(rx_uploads)} images chargées en file d'attente.")
 
+    # --- ACTION D'ANALYSE ---
     if mask_upload and rx_uploads:
         if st.button("▶️ Lancer l'analyse de la série", use_container_width=True):
             
-            # --- PRÉPARATION DU MASQUE UNIQUE ---
+            # Lecture du masque
             mask_bytes = np.frombuffer(mask_upload.read(), np.uint8)
             insp = cv2.imdecode(mask_bytes, cv2.IMREAD_COLOR)
             b_c, g_c, r_c = cv2.split(insp)
@@ -71,34 +74,32 @@ if model_file:
             status_text = st.empty()
             progress_bar = st.progress(0)
             
+            # On réinitialise l'historique seulement au lancement d'un nouveau batch 
+            # si on veut éviter de cumuler, sinon on laisse tel quel.
+            # st.session_state.batch_history = [] 
+
             for idx, rx_file in enumerate(rx_uploads):
                 status_text.text(f"Analyse de {rx_file.name} ({idx+1}/{len(rx_uploads)})...")
                 
-                # 1. Charger et traiter image RX
                 img_gray = engine.load_gray(rx_file, contrast_limit=contrast_val)
                 H, W = img_gray.shape
 
-                # 2. Ajuster masque
                 z_adj = cv2.resize(z_utile, (W, H), interpolation=cv2.INTER_NEAREST)
                 env_adj = cv2.resize(m_green, (W, H), interpolation=cv2.INTER_NEAREST)
                 hol_adj = cv2.resize(m_black, (W, H), interpolation=cv2.INTER_NEAREST)
 
-                # 3. Analyse IA
                 features = engine.compute_features(img_gray)
-                n_f = features.shape[-1]
-                probs = clf.predict_proba(features.reshape(-1, n_f))
+                probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
                 pred_map = np.argmax(probs, axis=1).reshape(H, W)
                 conf_map = np.max(probs, axis=1).reshape(H, W)
-                mean_conf = np.mean(conf_map[z_adj > 0]) * 100 if np.any(z_adj > 0) else 0
+                mean_conf = np.mean(conf_map[z_adj > 0]) * 100 if np.sum(z_adj > 0) > 0 else 0
 
-                # 4. Calculs Manque soudure
                 valid_solder = (pred_map == 1) & (z_adj > 0)
-                valid_voids = (pred_map == 0) & (z_adj > 0)
                 area_px = np.sum(z_adj > 0)
                 missing_pct = (1.0 - (np.sum(valid_solder) / area_px)) * 100.0 if area_px > 0 else 0
 
-                # 5. Filtrage Voids (Top 5)
-                v_mask = (valid_voids.astype(np.uint8)) * 255
+                # Top 5 Voids
+                v_mask = ((pred_map == 0) & (z_adj > 0)).astype(np.uint8) * 255
                 cnts, _ = cv2.findContours(v_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 internals = []
                 for c in cnts:
@@ -114,30 +115,27 @@ if model_file:
                 
                 top_5 = sorted(internals, key=lambda x: x['area'], reverse=True)[:5]
 
-                # 6. Création de l'Overlay & COMPRESSION JPEG (Sécurité RAM)
+                # Overlay & Compression
                 overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-                overlay[valid_solder] = [255, 255, 0] # Jaune
-                overlay[valid_voids] = [255, 0, 0]   # Rouge
-                # Note: On ne dessine pas les contours cyan en batch pour gagner du temps, 
-                # ou vous pouvez les ajouter ici si nécessaire.
-
+                overlay[valid_solder] = [255, 255, 0]
+                overlay[(pred_map == 0) & (z_adj > 0)] = [255, 0, 0]
+                
                 _, img_jpg = cv2.imencode(".jpg", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 
-                # 7. Archivage optimisé
                 entry = {
                     "Fichier": rx_file.name,
                     "Total_%": round(missing_pct, 2),
                     "Confiance_%": round(mean_conf, 1),
-                    "img_bytes": img_jpg.tobytes() # Stockage compact
+                    "img_bytes": img_jpg.tobytes()
                 }
                 for i in range(5):
-                    v_val = (top_5[i]['area'] / area_px * 100) if i < len(top_5) else 0.0
+                    v_val = (top_5[i]['area'] / area_px * 100) if (area_px > 0 and i < len(top_5)) else 0.0
                     entry[f"V{i+1}_%"] = round(v_val, 3)
                 
                 st.session_state.batch_history.append(entry)
                 
-                # NETTOYAGE MÉMOIRE
-                del img_gray, features, probs, pred_map, conf_map, overlay, z_adj, env_adj, hol_adj
+                # Cleanup
+                del img_gray, features, probs, pred_map, conf_map, overlay
                 gc.collect()
                 progress_bar.progress((idx + 1) / len(rx_uploads))
 
@@ -148,23 +146,20 @@ if st.session_state.batch_history:
     st.divider()
     st.subheader("📊 Résultats de la Série")
 
-    # ZIP avec images compressées
+    # ZIP
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
         df_full = pd.DataFrame(st.session_state.batch_history)
         df_csv = df_full.drop(columns=['img_bytes'])
         z.writestr("rapport_batch.csv", df_csv.to_csv(index=False))
-        for item in st.session_state.batch_history:
+        for i, item in enumerate(st.session_state.batch_history):
             z.writestr(f"analyses/{item['Fichier']}.jpg", item['img_bytes'])
 
     st.download_button("🎁 Télécharger ZIP Complet", buf.getvalue(), "batch_export.zip", "application/zip", use_container_width=True)
-
-    # Tableau
     st.dataframe(df_csv, use_container_width=True)
 
-    # Galerie de miniatures (Lecture directe des bytes)
     st.write("### 🖼️ Galerie")
     cols = st.columns(6)
     for idx, item in enumerate(st.session_state.batch_history):
         with cols[idx % 6]:
-            st.image(item['img_bytes'], caption=f"{item['Fichier']} ({item['Total_%']}%)")
+            st.image(item['img_bytes'], caption=f"{item['Fichier']}")
