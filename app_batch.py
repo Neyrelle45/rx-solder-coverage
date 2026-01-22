@@ -27,7 +27,7 @@ st.title("📦 Analyse de Série (Batch)")
 st.sidebar.title("⚙️ Paramètres")
 model_file = st.sidebar.file_uploader("1. Charger modèle IA (.joblib)", type=["joblib"])
 
-# MODIFICATION ICI : step=0.1 pour un réglage plus fin
+# Slider avec pas de 0.1
 contrast_val = st.sidebar.slider("2. Contraste (CLAHE)", 0.0, 10.0, 2.0, 0.1)
 
 st.sidebar.divider()
@@ -37,21 +37,31 @@ ty = st.sidebar.number_input("Translation Y", value=0)
 rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
 sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
-if st.sidebar.button("🗑️ Réinitialiser la session"):
-    st.session_state.batch_history = []
-    st.rerun()
-
 # --- CHARGEMENT DES FICHIERS ---
+st.divider()
 col_u, col_m = st.columns(2)
 with col_u:
     uploaded_rx = st.file_uploader("Images RX (plusieurs possibles)", type=["png", "jpg", "jpeg", "tif"], accept_multiple_files=True)
 with col_m:
     mask_file = st.file_uploader("Masque de référence (Unique)", type=["png", "jpg"])
 
+# --- ACTIONS ---
+st.divider()
+c_run, c_clear = st.columns([3, 1])
+
+with c_run:
+    run_analysis = st.button("🚀 Lancer l'analyse de la série", use_container_width=True)
+
+with c_clear:
+    # Bouton pour vider l'historique sans toucher aux uploads
+    if st.button("🗑️ Vider les résultats", use_container_width=True):
+        st.session_state.batch_history = []
+        st.rerun()
+
 if model_file and uploaded_rx and mask_file:
     clf = joblib.load(model_file)
     
-    if st.button("🚀 Lancer l'analyse de la série", use_container_width=True):
+    if run_analysis:
         st.session_state.batch_history = [] 
         
         mask_bytes = mask_file.getvalue()
@@ -75,6 +85,7 @@ if model_file and uploaded_rx and mask_file:
             env_adj = cv2.warpAffine(m_green_res, M, (W, H), flags=cv2.INTER_NEAREST)
             hol_adj = cv2.warpAffine(m_black_res, M, (W, H), flags=cv2.INTER_NEAREST)
             z_utile = (env_adj & ~hol_adj)
+            area_total_px = np.sum(z_utile > 0)
 
             # 3. IA
             features = engine.compute_features(img_gray)
@@ -83,31 +94,46 @@ if model_file and uploaded_rx and mask_file:
             conf_map = np.max(probs, axis=1).reshape(H, W)
             mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-            # 4. Calculs Couverture
-            valid_solder = (pred_map == 1) & (z_utile > 0)
-            valid_voids = (pred_map == 0) & (z_utile > 0)
-            area_total_px = np.sum(z_utile > 0)
-            missing_pct = (1.0 - (np.sum(valid_solder) / area_total_px)) * 100.0 if area_total_px > 0 else 0
+            # 4. FILTRAGE DES MICRO-VOIDS (Re-catégorisés en Jaune)
+            void_raw_mask = (pred_map == 0) & (z_utile > 0)
+            void_u8 = void_raw_mask.astype(np.uint8) * 255
+            cnts, _ = cv2.findContours(void_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            valid_voids_mask = np.zeros((H, W), dtype=bool)
+            micro_voids_mask = np.zeros((H, W), dtype=bool)
+            
+            for c in cnts:
+                area = cv2.contourArea(c)
+                if area_total_px > 0:
+                    pct = (area / area_total_px) * 100
+                    if pct >= 0.1:
+                        cv2.drawContours(valid_voids_mask.view(np.uint8), [c], -1, 1, -1)
+                    else:
+                        cv2.drawContours(micro_voids_mask.view(np.uint8), [c], -1, 1, -1)
 
-            # 5. Recherche du Void Majeur (Strictement enclavé dans le jaune)
+            # 5. Calculs Couverture (Soudure réelle + Micro-bulles)
+            # Les micro-bulles sont ajoutées au valid_solder pour l'affichage et le calcul
+            display_solder = ((pred_map == 1) & (z_utile > 0)) | micro_voids_mask
+            display_voids = valid_voids_mask
+            
+            missing_pct = (np.sum(display_voids) / area_total_px) * 100.0 if area_total_px > 0 else 0
+
+            # 6. Recherche du Void Majeur (Cyan)
             max_void_area = 0
             max_void_poly = None
-            solder_u8 = valid_solder.astype(np.uint8) * 255
+            solder_u8 = display_solder.astype(np.uint8) * 255
             solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             for s_cnt in solder_cnts:
                 s_mask = np.zeros((H, W), dtype=np.uint8)
                 cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
-                # Trous à l'intérieur de cet îlot jaune
-                holes = cv2.bitwise_and(s_mask, cv2.bitwise_not(solder_u8))
+                holes = cv2.bitwise_and(s_mask, display_voids.astype(np.uint8) * 255)
                 h_cnts, _ = cv2.findContours(holes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
                 for h_cnt in h_cnts:
                     area = cv2.contourArea(h_cnt)
-                    if area < 10.0: continue
                     h_m = np.zeros((H, W), dtype=np.uint8)
                     cv2.drawContours(h_m, [h_cnt], -1, 255, -1)
-                    # Exclusion si touche une zone noire (via)
                     if not np.any((h_m > 0) & (hol_adj > 0)):
                         if area > max_void_area:
                             max_void_area = area
@@ -115,16 +141,15 @@ if model_file and uploaded_rx and mask_file:
 
             max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-            # 6. Génération Overlay
+            # 7. Génération Overlay
             overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-            overlay[valid_solder] = [255, 255, 0]
-            overlay[valid_voids] = [255, 0, 0]
+            overlay[display_solder] = [255, 255, 0] # Jaune (Soudure + Micro-bulles)
+            overlay[display_voids] = [255, 0, 0]    # Rouge (Bulles > 0.1%)
             if max_void_poly is not None:
                 cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 2)
 
-            # 7. Stockage JPEG (RAM Optimisée)
+            # 8. Stockage
             _, img_jpg = cv2.imencode(".jpg", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            
             st.session_state.batch_history.append({
                 "Fichier": rx_file.name,
                 "Total_%": round(missing_pct, 2),
@@ -132,51 +157,32 @@ if model_file and uploaded_rx and mask_file:
                 "Confiance_%": round(mean_conf, 1),
                 "img_bytes": img_jpg.tobytes()
             })
-            
             progress_bar.progress((idx + 1) / len(uploaded_rx))
         
-        st.success(f"Terminé : {len(uploaded_rx)} images analysées.")
+        st.success(f"Analyse terminée.")
 
 # --- AFFICHAGE ET EXPORT ---
 if st.session_state.batch_history:
     st.divider()
-    st.subheader("📊 Rapport de Série")
-    
     df_full = pd.DataFrame(st.session_state.batch_history)
     df_csv = df_full.drop(columns=['img_bytes'])
-    
-    # Tableau avec limitation au Void Max
     st.dataframe(df_csv.style.apply(highlight_extremes, subset=['Total_%'], axis=0), use_container_width=True)
 
-    # --- BLOC D'EXTRACTION ZIP ---
+    # Export ZIP
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as z:
-        # Ajout du fichier CSV
         z.writestr("rapport_batch.csv", df_csv.to_csv(index=False))
-        # Ajout des images compressées
         for i, item in enumerate(st.session_state.batch_history):
             z.writestr(f"images/{item['Fichier']}_analysed.jpg", item['img_bytes'])
     
     col_dl1, col_dl2 = st.columns(2)
     with col_dl1:
-        st.download_button(
-            label="📥 Télécharger ZIP (Images + CSV)",
-            data=zip_buffer.getvalue(),
-            file_name=f"batch_rx_{datetime.datetime.now().strftime('%Y%m%d')}.zip",
-            mime="application/zip",
-            use_container_width=True
-        )
+        st.download_button("📥 ZIP (Images + CSV)", zip_buffer.getvalue(), "batch_export.zip", "application/zip", use_container_width=True)
     with col_dl2:
-        st.download_button(
-            label="📄 Télécharger CSV Uniquement",
-            data=df_csv.to_csv(index=False),
-            file_name="rapport_batch.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+        st.download_button("📄 CSV Uniquement", df_csv.to_csv(index=False), "rapport.csv", "text/csv", use_container_width=True)
 
-    # Galerie de miniatures
-    with st.expander("👁️ Visualiser les résultats de la série"):
+    # Vignettes affichées par défaut (expanded=True)
+    with st.expander("👁️ Visualiser les miniatures de la série", expanded=True):
         cols = st.columns(6)
         for idx, item in enumerate(st.session_state.batch_history):
             with cols[idx % 6]:
