@@ -7,9 +7,9 @@ import io
 import zipfile
 import analyse_rx_soudure as engine
 
-st.set_page_config(page_title="RX Expert - Formatage Final", layout="wide")
+st.set_page_config(page_title="RX Expert - Version Cumulée", layout="wide")
 
-# Initialisation de l'historique
+# Initialisation de l'historique si inexistant
 if 'batch_history' not in st.session_state:
     st.session_state.batch_history = []
 
@@ -19,7 +19,7 @@ def apply_table_style(df):
                    .highlight_min(subset=['Total_%'], color='#cce5ff', axis=0)
 
 # --- INTERFACE ---
-st.title("📦 Analyse de Série (Formatage des Résultats)")
+st.title("📦 Analyse de Série (Incrémentation des Résultats)")
 
 st.sidebar.title("⚙️ Contrôles")
 model_file = st.sidebar.file_uploader("1. Modèle IA", type=["joblib"])
@@ -32,6 +32,7 @@ rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
 sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
 st.sidebar.divider()
+# Ce bouton reste le seul moyen de vider le tableau
 if st.sidebar.button("🗑️ Vider tout l'historique", use_container_width=True):
     st.session_state.batch_history = []
     st.rerun()
@@ -47,6 +48,8 @@ trigger = st.button("🚀 Lancer l'analyse (Ajouter à la suite)", use_container
 
 if trigger and model_file and uploaded_rx and mask_file:
     clf = joblib.load(model_file)
+    
+    # --- MODIFICATION ICI : On ne vide plus st.session_state.batch_history ---
     
     # 1. PRÉPARATION DES MASQUES MAITRES
     m_raw = cv2.imdecode(np.frombuffer(mask_file.read(), np.uint8), cv2.IMREAD_COLOR)
@@ -73,6 +76,7 @@ if trigger and model_file and uploaded_rx and mask_file:
         # 3. IA & SEGMENTATION ROUGE
         feats = engine.compute_features(img_gray)
         raw_pred = np.argmax(clf.predict_proba(feats.reshape(-1, feats.shape[-1])), axis=1).reshape(H, W)
+        
         mask_red = ((raw_pred == 0) & (z_inspectee > 0)).astype(np.uint8)
         
         # 4. LOGIQUE VOID MAX (AUCUN CONTACT VIA/BORD)
@@ -97,65 +101,52 @@ if trigger and model_file and uploaded_rx and mask_file:
         # 5. RENDU VISUEL
         img_rx_col = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         res_rgb = img_rx_col.copy()
+        
         overlay = res_rgb.copy()
         overlay[env_adj > 0] = [255, 255, 0] 
         overlay[mask_red > 0] = [255, 0, 0]   
         res_rgb = np.where(env_adj[:,:,None] > 0, overlay, res_rgb)
+        
+        # RÉTABLISSEMENT DES VIAS (TRANSPARENCE)
         res_rgb[hol_adj > 0] = img_rx_col[hol_adj > 0]
         
+        # CONTOUR CYAN (Void Max Interne)
         if v_max_poly is not None:
             cv2.drawContours(res_rgb, [v_max_poly], -1, [0, 255, 255], 2)
 
-        # 6. CALCULS ET FORMATAGE
-        raw_total = (np.sum(mask_red) / area_ref * 100) if area_ref > 0 else 0
-        raw_void_max = (v_max_area / area_ref * 100) if area_ref > 0 else 0
-        
-        # Formatage Manque Total (Arrondi entier)
-        fmt_total = f"{int(round(raw_total))}%"
-        
-        # Formatage Void Max
-        if raw_void_max < 1.0:
-            fmt_void = "<1%"
-        else:
-            fmt_void = f"{int(round(raw_void_max))}%"
+        # 6. CALCULS & AJOUT À L'HISTORIQUE (CUMULÉ)
+        total_pct = (np.sum(mask_red) / area_ref * 100) if area_ref > 0 else 0
+        void_max_pct = (v_max_area / area_ref * 100) if area_ref > 0 else 0
 
         _, enc = cv2.imencode(".jpg", cv2.cvtColor(res_rgb, cv2.COLOR_RGB2BGR))
         st.session_state.batch_history.append({
             "Fichier": rx_f.name,
-            "Total_%": raw_total,          # On garde le float pour le code couleur
-            "Affichage_Total": fmt_total,  # Texte pour le tableau
-            "Void_Max_%": fmt_void,        # Texte selon votre règle
+            "Total_%": round(total_pct, 2),
+            "Void_Max_%": round(void_max_pct, 3),
             "img_bytes": enc.tobytes()
         })
         progress.progress((idx + 1) / len(uploaded_rx))
 
 # --- AFFICHAGE FINAL ---
 if st.session_state.batch_history:
-    df_raw = pd.DataFrame(st.session_state.batch_history)
+    df = pd.DataFrame(st.session_state.batch_history)
+    st.subheader(f"📊 Résultats (Total : {len(df)} images)")
     
-    # On prépare le tableau final pour l'utilisateur
-    df_display = df_raw.copy()
-    # On remplace les colonnes par les versions formatées
-    df_display["Total_%"] = df_raw["Affichage_Total"]
-    df_display = df_display.drop(columns=["Affichage_Total", "img_bytes"])
+    # Affichage du tableau avec code couleur
+    st.dataframe(apply_table_style(df.drop(columns=['img_bytes'])), use_container_width=True)
     
-    st.subheader(f"📊 Résultats (Total : {len(df_raw)} images)")
-    
-    # On applique le style sur le df_display mais en utilisant les valeurs numériques du df_raw pour les calculs de min/max si nécessaire, 
-    # ou plus simplement on affiche le dataframe formaté directement.
-    st.dataframe(df_display, use_container_width=True)
-    
-    # Export ZIP
+    # Bouton d'archivage ZIP de tout l'historique
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as z:
-        z.writestr("rapport.csv", df_display.to_csv(index=False))
+        z.writestr("rapport_complet.csv", df.drop(columns=['img_bytes']).to_csv(index=False))
         for i, item in enumerate(st.session_state.batch_history):
+            # Ajout d'un index pour éviter les doublons de noms de fichiers
             z.writestr(f"images/{i}_{item['Fichier']}.jpg", item['img_bytes'])
+    
     st.download_button("📥 Télécharger TOUTE l'archive ZIP", zip_buf.getvalue(), "analyse_globale.zip", use_container_width=True)
 
+    # Galerie des vignettes
     st.subheader("👁️ Galerie cumulée")
     grid = st.columns(4)
     for i, item in enumerate(st.session_state.batch_history):
-        # Pour la légende sous les vignettes, on utilise aussi le format arrondi
-        caption_txt = f"{item['Fichier']} (Total: {item['Affichage_Total']} | Max: {item['Void_Max_%']})"
-        grid[i % 4].image(item['img_bytes'], caption=caption_txt)
+        grid[i % 4].image(item['img_bytes'], caption=f"{item['Fichier']} ({item['Total_%']}%)")
