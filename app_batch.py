@@ -6,28 +6,22 @@ import joblib
 import io
 import zipfile
 import datetime
-import os
 import analyse_rx_soudure as engine
 
-st.set_page_config(page_title="RX Expert - Analyse Batch Pro", layout="wide")
+st.set_page_config(page_title="RX Expert - Analyse Batch (Sync Fix)", layout="wide")
 
-# --- INITIALISATION ---
 if 'batch_history' not in st.session_state:
     st.session_state.batch_history = []
 
 def highlight_extremes(s):
     if len(s) < 2: return [''] * len(s)
     is_max = s == s.max()
-    is_min = s == s.min()
-    return ['background-color: #ffcccc' if v else 'background-color: #ccf2ff' if m else '' for v, m in zip(is_max, is_min)]
+    return ['background-color: #ffcccc' if v else '' for v in is_max]
 
-st.title("📦 Analyse de Série (Batch)")
+st.title("📦 Analyse de Série (Batch Correctif)")
 
-# --- CONFIGURATION SIDEBAR ---
 st.sidebar.title("⚙️ Paramètres")
-model_file = st.sidebar.file_uploader("1. Charger modèle IA (.joblib)", type=["joblib"])
-
-# Slider avec pas de 0.1
+model_file = st.sidebar.file_uploader("1. Modèle IA", type=["joblib"])
 contrast_val = st.sidebar.slider("2. Contraste (CLAHE)", 0.0, 10.0, 2.0, 0.1)
 
 st.sidebar.divider()
@@ -37,26 +31,17 @@ ty = st.sidebar.number_input("Translation Y", value=0)
 rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
 sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
-# --- CHARGEMENT DES FICHIERS ---
-st.divider()
 col_u, col_m = st.columns(2)
 with col_u:
-    uploaded_rx = st.file_uploader("Images RX (plusieurs possibles)", type=["png", "jpg", "jpeg", "tif"], accept_multiple_files=True)
+    uploaded_rx = st.file_uploader("Images RX", type=["png", "jpg", "jpeg", "tif"], accept_multiple_files=True)
 with col_m:
-    mask_file = st.file_uploader("Masque de référence (Unique)", type=["png", "jpg"])
+    mask_file = st.file_uploader("Masque de référence", type=["png", "jpg"])
 
-# --- ACTIONS ---
-st.divider()
 c_run, c_clear = st.columns([3, 1])
-
-with c_run:
-    run_analysis = st.button("🚀 Lancer l'analyse de la série", use_container_width=True)
-
-with c_clear:
-    # Bouton pour vider l'historique sans toucher aux uploads
-    if st.button("🗑️ Vider les résultats", use_container_width=True):
-        st.session_state.batch_history = []
-        st.rerun()
+run_analysis = c_run.button("🚀 Lancer l'analyse", use_container_width=True)
+if c_clear.button("🗑️ Vider les résultats", use_container_width=True):
+    st.session_state.batch_history = []
+    st.rerun()
 
 if model_file and uploaded_rx and mask_file:
     clf = joblib.load(model_file)
@@ -64,126 +49,85 @@ if model_file and uploaded_rx and mask_file:
     if run_analysis:
         st.session_state.batch_history = [] 
         
-        mask_bytes = mask_file.getvalue()
-        insp_raw = cv2.imdecode(np.frombuffer(mask_bytes, np.uint8), 1)
-        b_r, g_r, r_r = cv2.split(insp_raw)
-        m_green_orig = (g_r > 100).astype(np.uint8)
-        m_black_orig = ((b_r < 50) & (g_r < 50) & (r_r < 50) & (m_green_orig > 0)).astype(np.uint8)
+        # --- LECTURE SÉCURISÉE DU MASQUE ---
+        mask_raw = cv2.imdecode(np.frombuffer(mask_file.read(), np.uint8), cv2.IMREAD_COLOR)
+        b_r, g_r, r_r = cv2.split(mask_raw)
+        m_green_base = (g_r > 100).astype(np.uint8)
+        m_black_base = ((b_r < 50) & (g_r < 50) & (r_r < 50) & (m_green_base > 0)).astype(np.uint8)
 
         progress_bar = st.progress(0)
         
         for idx, rx_file in enumerate(uploaded_rx):
-            # 1. Chargement Image
+            # 1. Image
             img_gray = engine.load_gray(rx_file, contrast_limit=contrast_val)
             H, W = img_gray.shape
 
-            # 2. Ajustement Masque
-            m_green_res = cv2.resize(m_green_orig, (W, H), interpolation=cv2.INTER_NEAREST)
-            m_black_res = cv2.resize(m_black_orig, (W, H), interpolation=cv2.INTER_NEAREST)
+            # 2. Synchronisation précise du masque pour CHAQUE image
+            m_green_res = cv2.resize(m_green_base, (W, H), interpolation=cv2.INTER_NEAREST)
+            m_black_res = cv2.resize(m_black_base, (W, H), interpolation=cv2.INTER_NEAREST)
             
             M = engine.compose_similarity(sc, rot, float(tx), float(ty), W/2, H/2)
             env_adj = cv2.warpAffine(m_green_res, M, (W, H), flags=cv2.INTER_NEAREST)
             hol_adj = cv2.warpAffine(m_black_res, M, (W, H), flags=cv2.INTER_NEAREST)
-            z_utile = (env_adj & ~hol_adj)
-            area_total_px = np.sum(z_utile > 0)
+            
+            # Zone d'inspection = Vert SANS le Noir
+            z_utile = (env_adj > 0) & (hol_adj == 0)
+            area_total_px = np.sum(z_utile)
 
             # 3. IA
             features = engine.compute_features(img_gray)
             probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
             pred_map = np.argmax(probs, axis=1).reshape(H, W)
-            conf_map = np.max(probs, axis=1).reshape(H, W)
-            mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-            # 4. FILTRAGE DES MICRO-VOIDS (Re-catégorisés en Jaune)
-            void_raw_mask = (pred_map == 0) & (z_utile > 0)
-            void_u8 = void_raw_mask.astype(np.uint8) * 255
-            cnts, _ = cv2.findContours(void_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # 4. Filtrage micro-bulles (fusion en Jaune si < 0.1%)
+            void_mask = (pred_map == 0) & z_utile
+            cnts, _ = cv2.findContours(void_mask.astype(np.uint8)*255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            valid_voids_mask = np.zeros((H, W), dtype=bool)
-            micro_voids_mask = np.zeros((H, W), dtype=bool)
-            
+            final_voids = np.zeros((H, W), dtype=bool)
             for c in cnts:
-                area = cv2.contourArea(c)
-                if area_total_px > 0:
-                    pct = (area / area_total_px) * 100
-                    if pct >= 0.1:
-                        cv2.drawContours(valid_voids_mask.view(np.uint8), [c], -1, 1, -1)
-                    else:
-                        cv2.drawContours(micro_voids_mask.view(np.uint8), [c], -1, 1, -1)
+                if (cv2.contourArea(c) / area_total_px * 100) >= 0.1:
+                    cv2.drawContours(final_voids.view(np.uint8), [c], -1, 1, -1)
 
-            # 5. Calculs Couverture (Soudure réelle + Micro-bulles)
-            # Les micro-bulles sont ajoutées au valid_solder pour l'affichage et le calcul
-            display_solder = ((pred_map == 1) & (z_utile > 0)) | micro_voids_mask
-            display_voids = valid_voids_mask
+            final_solder = (z_utile) & (~final_voids)
             
-            missing_pct = (np.sum(display_voids) / area_total_px) * 100.0 if area_total_px > 0 else 0
-
-            # 6. Recherche du Void Majeur (Cyan)
+            # 5. Void Majeur (Cyan)
             max_void_area = 0
             max_void_poly = None
-            solder_u8 = display_solder.astype(np.uint8) * 255
-            solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            void_u8 = final_voids.astype(np.uint8)*255
+            v_cnts, _ = cv2.findContours(void_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for vc in v_cnts:
+                area = cv2.contourArea(vc)
+                if area > max_void_area:
+                    max_void_area = area
+                    max_void_poly = vc
 
-            for s_cnt in solder_cnts:
-                s_mask = np.zeros((H, W), dtype=np.uint8)
-                cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
-                holes = cv2.bitwise_and(s_mask, display_voids.astype(np.uint8) * 255)
-                h_cnts, _ = cv2.findContours(holes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                for h_cnt in h_cnts:
-                    area = cv2.contourArea(h_cnt)
-                    h_m = np.zeros((H, W), dtype=np.uint8)
-                    cv2.drawContours(h_m, [h_cnt], -1, 255, -1)
-                    if not np.any((h_m > 0) & (hol_adj > 0)):
-                        if area > max_void_area:
-                            max_void_area = area
-                            max_void_poly = h_cnt
-
+            # 6. Statistiques
+            missing_pct = (np.sum(final_voids) / area_total_px * 100) if area_total_px > 0 else 0
             max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-            # 7. Génération Overlay
+            # 7. Overlay
             overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-            overlay[display_solder] = [255, 255, 0] # Jaune (Soudure + Micro-bulles)
-            overlay[display_voids] = [255, 0, 0]    # Rouge (Bulles > 0.1%)
+            overlay[final_solder] = [255, 255, 0] # Jaune
+            overlay[final_voids] = [255, 0, 0]    # Rouge
             if max_void_poly is not None:
                 cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 2)
 
-            # 8. Stockage
+            # 8. Archive
             _, img_jpg = cv2.imencode(".jpg", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             st.session_state.batch_history.append({
                 "Fichier": rx_file.name,
                 "Total_%": round(missing_pct, 2),
                 "Void_Max_%": round(max_void_pct, 3),
-                "Confiance_%": round(mean_conf, 1),
                 "img_bytes": img_jpg.tobytes()
             })
             progress_bar.progress((idx + 1) / len(uploaded_rx))
-        
-        st.success(f"Analyse terminée.")
 
-# --- AFFICHAGE ET EXPORT ---
+# --- AFFICHAGE ---
 if st.session_state.batch_history:
-    st.divider()
-    df_full = pd.DataFrame(st.session_state.batch_history)
-    df_csv = df_full.drop(columns=['img_bytes'])
-    st.dataframe(df_csv.style.apply(highlight_extremes, subset=['Total_%'], axis=0), use_container_width=True)
-
-    # Export ZIP
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w") as z:
-        z.writestr("rapport_batch.csv", df_csv.to_csv(index=False))
-        for i, item in enumerate(st.session_state.batch_history):
-            z.writestr(f"images/{item['Fichier']}_analysed.jpg", item['img_bytes'])
+    df = pd.DataFrame(st.session_state.batch_history).drop(columns=['img_bytes'])
+    st.dataframe(df.style.apply(highlight_extremes, subset=['Total_%']), use_container_width=True)
     
-    col_dl1, col_dl2 = st.columns(2)
-    with col_dl1:
-        st.download_button("📥 ZIP (Images + CSV)", zip_buffer.getvalue(), "batch_export.zip", "application/zip", use_container_width=True)
-    with col_dl2:
-        st.download_button("📄 CSV Uniquement", df_csv.to_csv(index=False), "rapport.csv", "text/csv", use_container_width=True)
-
-    # Vignettes affichées par défaut (expanded=True)
-    with st.expander("👁️ Visualiser les miniatures de la série", expanded=True):
-        cols = st.columns(6)
-        for idx, item in enumerate(st.session_state.batch_history):
-            with cols[idx % 6]:
-                st.image(item['img_bytes'], caption=f"{item['Total_%']}%")
+    with st.expander("👁️ Résultats Visuels", expanded=True):
+        cols = st.columns(4)
+        for i, item in enumerate(st.session_state.batch_history):
+            cols[i % 4].image(item['img_bytes'], caption=item['Fichier'])
