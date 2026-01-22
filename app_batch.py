@@ -12,32 +12,26 @@ st.set_page_config(page_title="RX Expert - Batch Final Fix", layout="wide")
 if 'batch_history' not in st.session_state:
     st.session_state.batch_history = []
 
-# --- FONCTIONS DE STYLE DU TABLEAU ---
-def style_stats(df):
-    """Applique les couleurs rouge (max total) et bleu (max void) au tableau"""
-    styler = df.style
-    if not df.empty:
-        # Rouge pour le maximum de manque total
-        styler = styler.highlight_max(subset=['Total_%'], color='#ffcccc')
-        # Bleu pour le plus gros macro-void (bulle)
-        styler = styler.highlight_max(subset=['Void_Max_%'], color='#cce5ff')
-    return styler
+# --- STYLE DU TABLEAU (Retour du Rouge et Bleu) ---
+def apply_table_style(df):
+    return df.style.highlight_max(subset=['Total_%'], color='#ffcccc') \
+                   .highlight_max(subset=['Void_Max_%'], color='#cce5ff')
 
-st.title("📦 Analyse de Série (Priorité Masque & Vias)")
+st.title("📦 Analyse de Série (Mode Strict)")
 
-# --- SIDEBAR ---
+# --- CONFIGURATION ---
 st.sidebar.title("⚙️ Paramètres")
 model_file = st.sidebar.file_uploader("1. Modèle IA", type=["joblib"])
 contrast_val = st.sidebar.slider("2. Contraste", 0.0, 10.0, 2.0, 0.1)
 
 st.sidebar.divider()
-st.sidebar.subheader("🕹️ Alignement")
+st.sidebar.subheader("🕹️ Alignement Masque")
 tx = st.sidebar.number_input("Translation X", value=0)
 ty = st.sidebar.number_input("Translation Y", value=0)
 rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
 sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
-if st.sidebar.button("🗑️ Vider les résultats"):
+if st.sidebar.button("🗑️ Vider l'historique"):
     st.session_state.batch_history = []
     st.rerun()
 
@@ -55,7 +49,7 @@ if trigger and model_file and uploaded_rx and mask_file:
     clf = joblib.load(model_file)
     st.session_state.batch_history = [] 
     
-    # 1. Préparation du Masque Source
+    # 1. Extraction des composants du masque
     m_raw = cv2.imdecode(np.frombuffer(mask_file.read(), np.uint8), cv2.IMREAD_COLOR)
     m_rgb = cv2.cvtColor(m_raw, cv2.COLOR_BGR2RGB)
     r_s, g_s, b_s = cv2.split(m_rgb)
@@ -65,24 +59,28 @@ if trigger and model_file and uploaded_rx and mask_file:
     progress = st.progress(0)
     
     for idx, rx_f in enumerate(uploaded_rx):
-        # 2. Image et Alignement
+        # 2. Image RX et Alignement
         img_gray = engine.load_gray(rx_f, contrast_limit=contrast_val)
         H, W = img_gray.shape
         M = engine.compose_similarity(sc, rot, float(tx), float(ty), W/2, H/2)
         
+        # Redimensionnement dynamique pour chaque image de la série
         env_adj = cv2.warpAffine(cv2.resize(base_green, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         hol_adj = cv2.warpAffine(cv2.resize(base_black, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         
-        # 3. Prédiction IA
+        # ZONE UTILE = Verte ET SANS les trous noirs
+        z_utile = (env_adj > 0) & (hol_adj == 0)
+        area_utile = np.sum(z_utile)
+
+        # 3. IA (On ne prédit que ce qui est nécessaire)
         feats = engine.compute_features(img_gray)
         pred = np.argmax(clf.predict_proba(feats.reshape(-1, feats.shape[-1])), axis=1).reshape(H, W)
 
-        # 4. LOGIQUE DE CALCUL (SOUSTRACTION DES VIAS)
-        # On définit le manque UNIQUEMENT là où l'IA dit "vide" ET où le masque dit "zone utile"
-        mask_red_raw = (pred == 0) & (env_adj > 0) & (hol_adj == 0)
+        # 4. CALCUL DES MANQUES (ROUGE)
+        # On force l'IA à se taire hors de la zone utile
+        mask_red_raw = (pred == 0) & z_utile
         
-        # Filtrage micro-bulles (0.1%)
-        area_utile = np.sum((env_adj > 0) & (hol_adj == 0))
+        # Filtrage micro-bulles (Seuil 0.1%)
         cnts, _ = cv2.findContours(mask_red_raw.astype(np.uint8)*255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         mask_red = np.zeros((H, W), dtype=bool)
         for c in cnts:
@@ -94,30 +92,33 @@ if trigger and model_file and uploaded_rx and mask_file:
         red_cnts, _ = cv2.findContours(mask_red.astype(np.uint8)*255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for rc in red_cnts:
             area = cv2.contourArea(rc)
-            # Collision : ne doit pas toucher le bord du composant ni un via
             t_m = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(t_m, [rc], -1, 255, 2)
+            # Une bulle ne doit toucher ni un via ni le bord du composant
             if not np.any((t_m > 0) & (hol_adj > 0)) and not np.any((t_m > 0) & (env_adj == 0)):
                 if area > v_max_area:
                     v_max_area = area
                     v_max_poly = rc
 
-        # 6. RENDU COULEUR (L'ordre est crucial pour les vias)
+        # 6. GÉNÉRATION DE L'IMAGE FINALE (Ordre de calques strict)
         res_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         
-        # a. On met tout le composant en JAUNE (Soudure par défaut)
-        res_rgb[env_adj > 0] = [255, 255, 0]
-        # b. On applique le ROUGE (Manques IA validés)
+        # Calque 1 : Toute la zone utile en Jaune (Soudure par défaut)
+        res_rgb[z_utile] = [255, 255, 0]
+        
+        # Calque 2 : On dessine les manques en Rouge
         res_rgb[mask_red] = [255, 0, 0]
-        # c. On "NETTOIE" les VIAS (Retour à l'image originale ou blanc)
-        # Ici on remet l'image RX originale dans les trous pour qu'ils soient visibles
+        
+        # Calque 3 : On "perce" les vias (On remet l'image originale dans les cercles noirs)
+        # Cela garantit que les vias restent gris/blancs et jamais rouges
         res_rgb[hol_adj > 0] = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)[hol_adj > 0]
         
+        # Calque 4 : Contour Cyan pour le plus gros manque interne
         if v_max_poly is not None:
             cv2.drawContours(res_rgb, [v_max_poly], -1, [0, 255, 255], 2)
 
-        # 7. Sauvegarde
-        _, enc = cv2.imencode(".jpg", cv2.cvtColor(res_rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        # 7. Stockage
+        _, enc = cv2.imencode(".jpg", cv2.cvtColor(res_rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         st.session_state.batch_history.append({
             "Fichier": rx_f.name,
             "Total_%": round((np.sum(mask_red)/area_utile*100), 2) if area_utile > 0 else 0,
@@ -126,24 +127,23 @@ if trigger and model_file and uploaded_rx and mask_file:
         })
         progress.progress((idx + 1) / len(uploaded_rx))
 
-# --- AFFICHAGE FINAL ---
+# --- AFFICHAGE ET EXPORT ---
 if st.session_state.batch_history:
     df = pd.DataFrame(st.session_state.batch_history)
-    df_display = df.drop(columns=['img_bytes'])
+    df_clean = df.drop(columns=['img_bytes'])
     
-    st.subheader("📊 Tableau Récapitulatif")
-    # Retour du code couleur : Rouge = Max Manque / Bleu = Max Bulle
-    st.dataframe(style_stats(df_display), use_container_width=True)
+    st.subheader("📊 Résultats de l'analyse")
+    st.dataframe(apply_table_style(df_clean), use_container_width=True)
     
-    # Export ZIP
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("rapport.csv", df_display.to_csv(index=False))
+    # ZIP
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as z:
+        z.writestr("rapport.csv", df_clean.to_csv(index=False))
         for item in st.session_state.batch_history:
             z.writestr(f"images/{item['Fichier']}.jpg", item['img_bytes'])
-    st.download_button("📥 Télécharger ZIP Complet", buf.getvalue(), "resultats_batch.zip", use_container_width=True)
+    st.download_button("📥 Télécharger ZIP Complet", zip_buf.getvalue(), "batch_results.zip", use_container_width=True)
 
-    with st.expander("👁️ Galerie des pièces", expanded=True):
+    with st.expander("👁️ Galerie (Vias Nettoyés)", expanded=True):
         grid = st.columns(4)
         for i, item in enumerate(st.session_state.batch_history):
-            grid[i % 4].image(item['img_bytes'], caption=f"{item['Fichier']} ({item['Total_%']}%)")
+            grid[i % 4].image(item['img_bytes'], caption=f"{item['Fichier']}")
