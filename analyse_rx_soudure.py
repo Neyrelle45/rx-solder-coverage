@@ -44,42 +44,51 @@ def list_images(d: str):
 
 def load_gray(path, contrast_limit=2.0) -> np.ndarray:
     """
-    Charge l'image, gère le 16-bit et applique le contraste CLAHE.
-    Supporte les chemins (string) et les fichiers Streamlit (FileUpload).
+    Charge une image et applique un contraste adaptatif (CLAHE).
     """
+    # Gestion du flux Streamlit ou du chemin texte
     if hasattr(path, 'read'):
-        # Cas Streamlit
         file_bytes = np.asarray(bytearray(path.read()), dtype=np.uint8)
         img = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
-        path.seek(0)
+        path.seek(0) # Important pour Streamlit
     else:
-        # Cas script standard
         img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
 
     if img is None:
         return None
 
+    # Conversion en gris si nécessaire
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Conversion 8-bit robuste
+    # Passage en 8 bits
     if img.dtype == np.uint16:
         mn, mx = int(img.min()), int(img.max())
         img = ((img.astype(np.float32) - mn) / (mx - mn + 1e-5) * 255.0).astype(np.uint8)
     elif img.dtype != np.uint8:
         img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    # AJOUT DU SLIDER : Filtre de contraste adaptatif
+    # --- LE PATCH CONTRASTE RÉGLABLE ---
     if contrast_limit > 0:
         clahe = cv2.createCLAHE(clipLimit=contrast_limit, tileGridSize=(8,8))
         img = clahe.apply(img)
-    
+
     return img
+
+def compute_confidence(clf, features):
+    """Calcule le score de confiance basé sur les probabilités de l'IA"""
+    # Récupère les probabilités pour chaque classe (Soudure vs Fond)
+    probs = clf.predict_proba(features)
+    # On prend la probabilité la plus haute pour chaque pixel
+    max_probs = np.max(probs, axis=1)
+    # Retourne la moyenne de certitude sur toute l'image
+    return np.mean(max_probs)
 
 def apply_clahe(img: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8)) -> np.ndarray:
     return cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size).apply(img)
 
 def compute_features(img: np.ndarray) -> np.ndarray:
+    img = cv2.medianBlur(img, 5)
     imgf = img.astype(np.float32)
     f_int = imgf / 255.0
     f_clahe = apply_clahe(img) / 255.0
@@ -483,7 +492,7 @@ def manual_align_single(img: np.ndarray,
 # TRAIN
 # =========================
 def train_model(images_dir: str, labels_dir: str, models_dir: str = "./MyDrive/OBC_mainboard/models",
-                n_estimators: int = 300, max_samples_per_image: int = 40000):
+                n_estimators: int = 500, max_samples_per_image: int = 40000):
     ensure_dir(models_dir)
     ims = list_images(images_dir)
     if not ims:
@@ -521,7 +530,7 @@ def train_model(images_dir: str, labels_dir: str, models_dir: str = "./MyDrive/O
         raise RuntimeError("Aucun pixel labelisé trouvé. Ajoute des scribbles rouge/jaune dans ./MyDrive/OBC_mainboard/labels.")
 
     X = np.vstack(Xs); y = np.concatenate(ys)
-    clf = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, class_weight="balanced", random_state=42).fit(X, y)
+    clf = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, class_weight="balanced", random_state=42, max_depth=12, min_samples_leaf=50).fit(X, y)
 
     yp = clf.predict(X)
     print("=== Rapport d'entraînement (indicatif) ===")
