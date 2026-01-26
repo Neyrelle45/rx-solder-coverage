@@ -92,32 +92,29 @@ import math
 def compute_features(img: np.ndarray) -> np.ndarray:
     imgf = img.astype(np.float32)
     
-    # 1. Intensités de base
+    # 1. Intensités (Correction engine. supprimée)
     f_int = imgf / 255.0
-    f_clahe = apply_clahe(img) / 255.0 # Utilise la fonction de ton engine
+    f_clahe = apply_clahe(img) / 255.0 
     
-    # 2. Gradients optimisés pour les bords droits (Scharr)
-    # Scharr est plus sensible aux lignes droites que Sobel
+    # 2. Gradients (Scharr pour la précision des bords droits)
     gx = cv2.Scharr(img, cv2.CV_32F, 1, 0)
     gy = cv2.Scharr(img, cv2.CV_32F, 0, 1)
     mag = cv2.magnitude(gx, gy)
     
-    # 3. STATISTIQUES DE VOISINAGE (Contexte)
-    # On compare une zone locale à une zone plus large pour identifier les pads
+    # 3. Contextes (Moyennes glissantes)
     mean3 = cv2.blur(imgf, (3, 3)) / 255.0
     mean15 = cv2.blur(imgf, (15, 15)) / 255.0
     
-    # 4. LE FILTRE "ANTI-GRIGNOTAGE" (Filtre Rectangulaire Vertical)
-    # On utilise un noyau 1x15 pour détecter la continuité verticale des bords
+    # 4. Filtre de continuité verticale (Pour les bandes latérales)
+    # Noyau de 15 pixels de haut sur 1 pixel de large
     vertical_kernel = np.ones((15, 1), np.float32) / 15.0
     v_continuity = cv2.filter2D(f_int, -1, vertical_kernel)
     
-    # 5. DIFFÉRENCE DE GAUSSIENNES (Isoler les Voids des Pads)
+    # 5. Différence de Gaussiennes (DoG) - Isole les ronds des lignes
     dog = (cv2.GaussianBlur(imgf, (3,3), 0) - cv2.GaussianBlur(imgf, (13,13), 0))
     dog = cv2.normalize(dog, None, 0, 1, cv2.NORM_MINMAX)
 
-    # 6. GABOR AVEC ANGLES FIXES (0° et 90°)
-    # Augmenter sigma (4.0) pour capter la masse des pads
+    # 6. Gabor (Stabilité des pads)
     g_0 = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((15,15), 4.0, 0, 10.0, 0.5, 0)), None, 0, 1, cv2.NORM_MINMAX)
     g_90 = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((15,15), 4.0, math.pi/2, 10.0, 0.5, 0)), None, 0, 1, cv2.NORM_MINMAX)
 
