@@ -94,35 +94,34 @@ def compute_features(img: np.ndarray) -> np.ndarray:
     
     # 1. Intensités de base
     f_int = imgf / 255.0
-    f_clahe = apply_clahe(img) / 255.0
+    f_clahe = engine.apply_clahe(img) / 255.0 # Utilise la fonction de ton engine
     
-    # 2. Détection de structures rectilignes (Filtres de Scharr)
-    # Plus précis que Sobel pour les bords des pistes
+    # 2. Gradients optimisés pour les bords droits (Scharr)
+    # Scharr est plus sensible aux lignes droites que Sobel
     gx = cv2.Scharr(img, cv2.CV_32F, 1, 0)
     gy = cv2.Scharr(img, cv2.CV_32F, 0, 1)
     mag = cv2.magnitude(gx, gy)
     
-    # 3. STATISTIQUES MULTI-ÉCHELLES (Le secret pour la géométrie)
-    # Fenêtre petite (3x3) pour les détails
+    # 3. STATISTIQUES DE VOISINAGE (Contexte)
+    # On compare une zone locale à une zone plus large pour identifier les pads
     mean3 = cv2.blur(imgf, (3, 3)) / 255.0
-    # Fenêtre large (15x15) : si c'est une piste, la moyenne reste stable
     mean15 = cv2.blur(imgf, (15, 15)) / 255.0
     
-    # 4. DIFFÉRENCE DE GAUSSIENNES (DoG)
-    # Très efficace pour séparer les "trous" ronds des surfaces planes
-    dog = (cv2.GaussianBlur(imgf, (3,3), 0) - cv2.GaussianBlur(imgf, (11,11), 0))
+    # 4. LE FILTRE "ANTI-GRIGNOTAGE" (Filtre Rectangulaire Vertical)
+    # On utilise un noyau 1x15 pour détecter la continuité verticale des bords
+    vertical_kernel = np.ones((15, 1), np.float32) / 15.0
+    v_continuity = cv2.filter2D(f_int, -1, vertical_kernel)
+    
+    # 5. DIFFÉRENCE DE GAUSSIENNES (Isoler les Voids des Pads)
+    dog = (cv2.GaussianBlur(imgf, (3,3), 0) - cv2.GaussianBlur(imgf, (13,13), 0))
     dog = cv2.normalize(dog, None, 0, 1, cv2.NORM_MINMAX)
 
-    # 5. FILTRES DE GABOR RENFORCÉS (Orientations 0, 45, 90, 135)
-    # On augmente la taille (15,15) pour "sentir" la longueur des pistes
-    features_list = [f_int, f_clahe, mag/mag.max(), dog, mean3, mean15]
-    
-    for angle in [0, math.pi/4, math.pi/2, 3*math.pi/4]:
-        kern = cv2.getGaborKernel((15, 15), 4.0, angle, 10.0, 0.5, 0, ktype=cv2.CV_32F)
-        f_gabor = cv2.filter2D(imgf, cv2.CV_32F, kern)
-        features_list.append(cv2.normalize(f_gabor, None, 0, 1, cv2.NORM_MINMAX))
+    # 6. GABOR AVEC ANGLES FIXES (0° et 90°)
+    # Augmenter sigma (4.0) pour capter la masse des pads
+    g_0 = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((15,15), 4.0, 0, 10.0, 0.5, 0)), None, 0, 1, cv2.NORM_MINMAX)
+    g_90 = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((15,15), 4.0, math.pi/2, 10.0, 0.5, 0)), None, 0, 1, cv2.NORM_MINMAX)
 
-    return np.stack(features_list, axis=-1)
+    return np.stack([f_int, f_clahe, mag/mag.max(), dog, mean3, mean15, v_continuity, g_0, g_90], axis=-1)
 
 # =========================
 # Labels (scribbles) — tolérant (.png/.jpg/.jpeg)
