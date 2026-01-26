@@ -103,22 +103,35 @@ if model_file:
                 area = cv2.contourArea(h_cnt)
                 if area < 10.0: continue
 
-# --- AJOUT DU FILTRE RATIO D'ASPECT 3.5 ---
-                rect = cv2.minAreaRect(h_cnt)
-                (x_r, y_r), (w_r, h_r), angle_r = rect
-                if min(w_r, h_r) > 0:
-                    aspect_ratio = max(w_r, h_r) / min(w_r, h_r)
-                    if aspect_ratio > 3.5:
-                        continue # On ignore les formes de type "bande"
+for h_cnt in h_cnts:
+                area = cv2.contourArea(h_cnt)
+                if area < 10.0: continue
+
+                # --- CALCUL DES FACTEURS DE FORME ---
+                perimeter = cv2.arcLength(h_cnt, True)
+                circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
                 
+                # Récupération du ratio d'aspect via le rectangle englobant minimal
+                rect = cv2.minAreaRect(h_cnt)
+                (w_r, h_r) = rect[1]
+                aspect_ratio = max(w_r, h_r) / min(w_r, h_r) if min(w_r, h_r) > 0 else 10
+
+                # --- CRITÈRE D'EXCLUSION DES PISTES (Formes allongées et fines) ---
+                # Les pistes sont peu circulaires ET très allongées
+                if circularity < 0.25 and aspect_ratio > 3.0:
+                    continue 
+
                 h_mask = np.zeros((H, W), dtype=np.uint8)
                 cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
                 
-                # CRITÈRE D'EXCLUSION : Ne doit pas contenir de zone noire (via/non inspecté)
+                # Exclusion des zones noires (Vias)
                 if np.any((h_mask > 0) & (hol_adj > 0)):
                     continue
                 
-                if area > max_void_area:
+                # --- IDENTIFICATION DU VOID MAJEUR ---
+                # On ne considère comme "Void Majeur" que ce qui est relativement compact
+                # pour éviter qu'une barre de bordure ne devienne le "Void Max"
+                if circularity > 0.4 and area > max_void_area:
                     max_void_area = area
                     max_void_poly = h_cnt
 
