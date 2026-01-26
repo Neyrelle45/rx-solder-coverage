@@ -60,6 +60,12 @@ if model_file:
         hol_adj = cv2.warpAffine(m_black_res, M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj & ~hol_adj)
 
+
+
+
+
+
+        
         # Analyse IA
         features = engine.compute_features(img_gray)
         probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
@@ -96,6 +102,14 @@ if model_file:
             for h_cnt in h_cnts:
                 area = cv2.contourArea(h_cnt)
                 if area < 10.0: continue
+
+# --- AJOUT DU FILTRE RATIO D'ASPECT 3.5 ---
+                rect = cv2.minAreaRect(h_cnt)
+                (x_r, y_r), (w_r, h_r), angle_r = rect
+                if min(w_r, h_r) > 0:
+                    aspect_ratio = max(w_r, h_r) / min(w_r, h_r)
+                    if aspect_ratio > 3.5:
+                        continue # On ignore les formes de type "bande"
                 
                 h_mask = np.zeros((H, W), dtype=np.uint8)
                 cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
@@ -117,6 +131,12 @@ if model_file:
         if max_void_poly is not None:
             cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
+
+
+
+
+
+        
         # Affichage et Archivage
         st.divider()
         c_res, c_img = st.columns([1, 2])
