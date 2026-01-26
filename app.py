@@ -131,13 +131,20 @@ if model_file:
                 if circularity > 0.4 and area > max_void_area:
                     max_void_area = area
                     max_void_poly = h_cnt
-
+                    
+# --- CALCULS FINAUX RECALIBRÉS ---
+        area_total_px = np.sum(z_utile > 0)
+        # On base le calcul sur le masque filtré pour ignorer les pistes
+        missing_pct = (np.sum(cleaned_voids_mask > 0) / area_total_px * 100.0) if area_total_px > 0 else 0
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
         # Overlay
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[valid_solder] = [255, 255, 0]
-        overlay[valid_voids] = [255, 0, 0]
+        overlay[valid_solder] = [255, 255, 0] # Soudure en Jaune
+        
+        # /!\ CHANGEMENT ICI : On n'affiche en rouge que les manques validés
+        overlay[cleaned_voids_mask > 0] = [255, 0, 0] 
+        
         if max_void_poly is not None:
             cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
