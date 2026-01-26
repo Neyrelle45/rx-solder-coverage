@@ -81,12 +81,12 @@ if model_file:
         for i in range(1, nb_components):
             # Seuil de 150 pixels : assez gros pour un void, trop petit pour une piste parasite
             if stats[i, cv2.CC_STAT_AREA] >= 150: 
-            cleaned_voids[output == i] = 1
+                cleaned_voids[output == i] = 1
 
-# On reconstruit la pred_map finale : 0 là où c'est un vrai void, 1 sinon (soudure)
-pred_map = np.ones_like(raw_pred)
-pred_map[cleaned_voids == 1] = 0 
-# ------------------------------------
+        # On reconstruit la pred_map finale : 0 là où c'est un vrai void, 1 sinon (soudure)
+        pred_map = np.ones_like(raw_pred)
+        pred_map[cleaned_voids == 1] = 0 
+        # ------------------------------------
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
         # Identification Zones
