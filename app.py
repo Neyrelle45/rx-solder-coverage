@@ -66,104 +66,74 @@ if model_file:
         probs = clf.predict_proba(features_flat)
         raw_pred = np.argmax(probs, axis=1).reshape(H, W)
         
-        # --- PATCH SÉCURITÉ : RESTRICTION IMMÉDIATE AU MASQUE ---
-        # On ne garde que les manques (0) qui sont DANS la zone verte et HORS zone noire
+        # --- FILTRAGE ET RECONSTRUCTION GÉOMÉTRIQUE ---
+        # On ne travaille que dans la zone autorisée (z_utile)
         voids_raw = ((raw_pred == 0) & (z_utile > 0)).astype(np.uint8)
 
-        # 2. RECONSTRUCTION (Capture des patatoïdes malgré le design cuivre)
-        # Fermeture pour lier les morceaux séparés par des lignes de cuivre internes
-        kernel_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-        voids_filled = cv2.morphologyEx(voids_raw, cv2.MORPH_CLOSE, kernel_fill)
+        # A. BOUCHAGE DES DESIGN INTERNES (Patatoïdes)
+        # On utilise une fermeture morphologique très large pour fusionner les zones rouges
+        # séparées par les pistes de design internes.
+        kernel_reconstruct = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        voids_closed = cv2.morphologyEx(voids_raw, cv2.MORPH_CLOSE, kernel_reconstruct)
         
-        # Remplissage des contours pour un aspect plein (sphéroïde)
-        cnts, _ = cv2.findContours(voids_filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        filled_mask = np.zeros_like(voids_raw)
+        # Remplissage par les contours : on rend les formes pleines
+        cnts, _ = cv2.findContours(voids_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filled_voids = np.zeros_like(voids_raw)
         for c in cnts:
-            cv2.drawContours(filled_mask, [c], -1, 1, -1)
+            cv2.drawContours(filled_voids, [c], -1, 1, -1)
 
-        # 3. FILTRAGE GÉOMÉTRIQUE AVANCÉ (Solidité + Ratio)
-        nb_components, output, stats, _ = cv2.connectedComponentsWithStats(filled_mask, connectivity=8)
+        # B. ÉLIMINATION DES RECTANGLES DE BORDURE (Pistes)
+        # On analyse chaque forme pour voir si c'est un "vrai" manque ou une ligne de cuivre
+        nb_components, output, stats, _ = cv2.connectedComponentsWithStats(filled_voids, connectivity=8)
         
-        cleaned_voids = np.zeros_like(filled_mask)
+        cleaned_voids = np.zeros_like(filled_voids)
         for i in range(1, nb_components):
             area = stats[i, cv2.CC_STAT_AREA]
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
             
-            # Aspect ratio (Allongement)
             aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
-            
-            # Solidité (Aire réelle / Aire du rectangle englobant)
-            # Un rectangle parfait = 1.0 | Un vrai void irrégulier < 0.8
+            # Solidité : Aire / (Largeur * Hauteur)
             solidity = area / float(w * h) if (w * h) > 0 else 0
 
-            # FILTRE : 
-            # - On élimine le petit bruit (< 150 px)
-            # - On élimine les formes trop rectangulaires ET allongées (pistes de bordure)
-            if area > 150:
-                # Si la forme est très "solide" (>0.85) ET allongée, c'est une piste
-                if not (aspect_ratio > 3.0 and solidity > 0.85):
+            # FILTRE : On ignore les formes trop fines (lignes) ou trop rectangulaires/solides
+            # Un manque est rarement un rectangle parfait de ratio > 3.
+            if area > 180: # Seuil de bruit légèrement augmenté
+                if not (aspect_ratio > 3.0 and solidity > 0.82):
                     cleaned_voids[output == i] = 1
 
-        # 4. APPLICATION FINALE ET NETTOYAGE
-        # Double sécurité pour éviter les détections hors-masque
+        # 4. APPLICATION FINALE (Strictement limitée à z_utile)
         valid_voids = (cleaned_voids > 0) & (z_utile > 0)
         valid_solder = (cleaned_voids == 0) & (z_utile > 0)
         
-        # Mise à jour de la map finale pour les calculs de % et l'affichage
+        # Reconstruction de la pred_map pour le calcul du Void Majeur
         pred_map = np.ones((H, W), dtype=np.uint8)
         pred_map[valid_voids] = 0
         
+        # --- CALCULS DES MÉTRIQUES ---
         conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
-
-        # Identification Zones
-        valid_solder = (pred_map == 1) & (z_utile > 0)
-        valid_voids = (pred_map == 0) & (z_utile > 0)
         area_total_px = np.sum(z_utile > 0)
-        missing_pct = (1.0 - (np.sum(valid_solder) / area_total_px)) * 100.0 if area_total_px > 0 else 0
+        missing_pct = (np.sum(valid_voids) / area_total_px) * 100.0 if area_total_px > 0 else 0
 
-        # --- LOGIQUE : VOID MAJEUR ENCLAVÉ DANS LE JAUNE ---
+        # --- LOGIQUE DU VOID MAJEUR (RESTAURÉE ET SÉCURISÉE) ---
         max_void_area = 0
         max_void_poly = None
-
-        # 1. On trouve les contours des zones de soudure (jaunes)
-        solder_u8 = valid_solder.astype(np.uint8) * 255
-        solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for s_cnt in solder_cnts:
-            # Pour chaque îlot de soudure, on crée un masque
-            s_mask = np.zeros((H, W), dtype=np.uint8)
-            cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
-            
-            # 2. On cherche les "trous" à l'intérieur de cet îlot
-            # Un trou est une zone qui n'est pas de la soudure MAIS qui est dans le périmètre de l'îlot
-            inverted_s_mask = cv2.bitwise_not(solder_u8)
-            holes_in_island = cv2.bitwise_and(s_mask, inverted_s_mask)
-            
-            h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for h_cnt in h_cnts:
-                area = cv2.contourArea(h_cnt)
-                if area < 10.0: continue
-                
-                h_mask = np.zeros((H, W), dtype=np.uint8)
-                cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
-                
-                # CRITÈRE D'EXCLUSION : Ne doit pas contenir de zone noire (via/non inspecté)
-                if np.any((h_mask > 0) & (hol_adj > 0)):
-                    continue
-                
-                if area > max_void_area:
-                    max_void_area = area
-                    max_void_poly = h_cnt
+        
+        # On cherche les îlots de vide dans la map nettoyée
+        void_cnts, _ = cv2.findContours(valid_voids.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for v_cnt in void_cnts:
+            area = cv2.contourArea(v_cnt)
+            if area > max_void_area:
+                max_void_area = area
+                max_void_poly = v_cnt
 
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
         # Overlay
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[valid_solder] = [255, 255, 0]
-        overlay[valid_voids] = [255, 0, 0]
+        overlay[valid_solder] = [255, 255, 0] # Jaune
+        overlay[valid_voids] = [255, 0, 0]   # Rouge
         if max_void_poly is not None:
             cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
