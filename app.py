@@ -66,50 +66,53 @@ if model_file:
         probs = clf.predict_proba(features_flat)
         raw_pred = np.argmax(probs, axis=1).reshape(H, W)
         
-        # 2. ISOLATION ET RECONSTRUCTION (Capture des patatoïdes)
-        # On extrait les manques détectés (0)
-        voids_raw = (raw_pred == 0).astype(np.uint8)
-        
-        # Fermeture morphologique large pour fusionner les zones rouges séparées par le design cuivre
-        # Cela crée les "blocs" de manques avant de tester leur forme
-        kernel_reconstruct = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-        voids_filled = cv2.morphologyEx(voids_raw, cv2.MORPH_CLOSE, kernel_reconstruct)
+        # --- PATCH SÉCURITÉ : RESTRICTION IMMÉDIATE AU MASQUE ---
+        # On ne garde que les manques (0) qui sont DANS la zone verte et HORS zone noire
+        voids_raw = ((raw_pred == 0) & (z_utile > 0)).astype(np.uint8)
 
-        # 3. FILTRAGE GÉOMÉTRIQUE (Élimination des pistes de bordure)
-        nb_components, output, stats, _ = cv2.connectedComponentsWithStats(voids_filled, connectivity=8)
+        # 2. RECONSTRUCTION (Capture des patatoïdes malgré le design cuivre)
+        # Fermeture pour lier les morceaux séparés par des lignes de cuivre internes
+        kernel_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        voids_filled = cv2.morphologyEx(voids_raw, cv2.MORPH_CLOSE, kernel_fill)
         
-        cleaned_voids = np.zeros_like(voids_filled)
+        # Remplissage des contours pour un aspect plein (sphéroïde)
+        cnts, _ = cv2.findContours(voids_filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filled_mask = np.zeros_like(voids_raw)
+        for c in cnts:
+            cv2.drawContours(filled_mask, [c], -1, 1, -1)
+
+        # 3. FILTRAGE GÉOMÉTRIQUE AVANCÉ (Solidité + Ratio)
+        nb_components, output, stats, _ = cv2.connectedComponentsWithStats(filled_mask, connectivity=8)
+        
+        cleaned_voids = np.zeros_like(filled_mask)
         for i in range(1, nb_components):
             area = stats[i, cv2.CC_STAT_AREA]
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
             
-            # Calcul de l'allongement
+            # Aspect ratio (Allongement)
             aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
             
-            # CRITÈRES : 
-            # - On garde les formes qui ne sont pas des lignes infinies (ratio < 4.0)
-            # - On garde ce qui a une taille significative
-            if area > 120 and aspect_ratio < 4.0:
-                cleaned_voids[output == i] = 1
+            # Solidité (Aire réelle / Aire du rectangle englobant)
+            # Un rectangle parfait = 1.0 | Un vrai void irrégulier < 0.8
+            solidity = area / float(w * h) if (w * h) > 0 else 0
 
-        # 4. REMPLISSAGE FINAL (Assurer l'aspect plein)
-        cnts, _ = cv2.findContours(cleaned_voids, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in cnts:
-            cv2.drawContours(cleaned_voids, [c], -1, 1, -1)
+            # FILTRE : 
+            # - On élimine le petit bruit (< 150 px)
+            # - On élimine les formes trop rectangulaires ET allongées (pistes de bordure)
+            if area > 150:
+                # Si la forme est très "solide" (>0.85) ET allongée, c'est une piste
+                if not (aspect_ratio > 3.0 and solidity > 0.85):
+                    cleaned_voids[output == i] = 1
 
-        # Application du masque de zone utile
+        # 4. APPLICATION FINALE ET NETTOYAGE
+        # Double sécurité pour éviter les détections hors-masque
         valid_voids = (cleaned_voids > 0) & (z_utile > 0)
         valid_solder = (cleaned_voids == 0) & (z_utile > 0)
         
-        # Mise à jour des maps pour l'affichage
+        # Mise à jour de la map finale pour les calculs de % et l'affichage
         pred_map = np.ones((H, W), dtype=np.uint8)
         pred_map[valid_voids] = 0
-        
-
-        # Mise à jour de la map finale
-        pred_map = np.ones_like(raw_pred)
-        pred_map[cleaned_voids == 1] = 0
         
         conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
