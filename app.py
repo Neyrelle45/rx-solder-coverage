@@ -72,16 +72,15 @@ if model_file:
         raw_pred = np.argmax(probs, axis=1).reshape(H, W)
         
         # --- SÉCURITÉ RADICALE : LE MASQUE EST ROI ---
-        # On crée un masque binaire propre de la zone verte (255 = dedans, 0 = dehors)
+        # 255 = dedans (vert), 0 = dehors
         mask_bin = np.where(z_utile > 0, 255, 0).astype(np.uint8)
 
-        # On isole les manques (Classe 1) et on FORCE le noir partout hors masque
-        # C'est ici que l'on empêche l'IA d'inspecter le fond gris
+        # On isole les manques (Classe 1) et on FORCE le noir hors masque
         voids_base = np.zeros((H, W), dtype=np.uint8)
         voids_base[(raw_pred == 1)] = 255
         voids_inside = cv2.bitwise_and(voids_base, voids_base, mask=mask_bin)
 
-        # 2. RECONSTRUCTION (L'effet patatoïde pour boucher le cuivre interne)
+        # 2. RECONSTRUCTION (Effet patatoïde pour boucher le cuivre interne)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         voids_closed = cv2.morphologyEx(voids_inside, cv2.MORPH_CLOSE, kernel)
         
@@ -91,7 +90,7 @@ if model_file:
         for c in cnts:
             cv2.drawContours(filled_mask, [c], -1, 255, -1)
 
-        # 3. FILTRAGE GÉOMÉTRIQUE (Suppression des bords de pads)
+        # 3. FILTRAGE GÉOMÉTRIQUE (Suppression des bords de pads / pistes)
         nb_components, output, stats, _ = cv2.connectedComponentsWithStats(filled_mask, connectivity=8)
         
         final_voids_mask = np.zeros_like(filled_mask)
@@ -100,25 +99,46 @@ if model_file:
             w, h = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
             solidity = area / float(w * h) if (w * h) > 0 else 0
             
-            # Si c'est assez grand et pas un rectangle parfait de bordure
-            if area > 150 and solidity < 0.9:
+            # Suppression si c'est une piste rectangulaire (très solide) ou trop petite
+            if area > 150 and solidity < 0.88:
                 final_voids_mask[output == i] = 255
 
-        # --- 4. AFFICHAGE FINAL ---
-        # Image de fond
-        overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        
-        # Zone de soudure (Tout le masque vert SAUF là où il y a des manques)
-        solder_mask = cv2.bitwise_and(mask_bin, cv2.bitwise_not(final_voids_mask))
-        
-        # Application des couleurs
-        overlay[solder_mask > 0] = [255, 255, 0]      # JAUNE (Soudure)
-        overlay[final_voids_mask > 0] = [255, 0, 0]   # ROUGE (Manques)
-
-        # 5. CALCULS (Indépendants de l'affichage)
+        # --- 4. CALCULS DES MÉTRIQUES (Correction de l'erreur max_void_pct) ---
         area_total_px = np.count_nonzero(mask_bin)
         area_voids_px = np.count_nonzero(final_voids_mask)
         missing_pct = (area_voids_px / area_total_px * 100) if area_total_px > 0 else 0
+        
+        # Identification du Void Majeur (le plus gros contour rouge)
+        max_void_area = 0
+        max_void_poly = None
+        v_cnts, _ = cv2.findContours(final_voids_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for v_c in v_cnts:
+            a = cv2.contourArea(v_c)
+            if a > max_void_area:
+                max_void_area = a
+                max_void_poly = v_c
+        
+        max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
+        
+        conf_map = np.max(probs, axis=1).reshape(H, W)
+        mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
+
+        # --- 5. AFFICHAGE OVERLAY ---
+        overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
+        
+        # Zone de soudure (Masque vert MOINS les manques rouges)
+        solder_mask = cv2.bitwise_and(mask_bin, cv2.bitwise_not(final_voids_mask))
+        
+        overlay[solder_mask > 0] = [255, 255, 0]      # JAUNE
+        overlay[final_voids_mask > 0] = [255, 0, 0]   # ROUGE
+        
+        # Encerclement du void majeur en cyan
+        if max_void_poly is not None:
+            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
+            
+        # Définition des variables pour l'archivage (pour éviter d'autres NameError)
+        valid_solder = (solder_mask > 0)
+        valid_voids = (final_voids_mask > 0)
 
 
 
