@@ -71,22 +71,22 @@ if model_file:
         probs = clf.predict_proba(features_flat)
         raw_pred = np.argmax(probs, axis=1).reshape(H, W)
         
-        # --- RECONSTRUCTION & FILTRAGE ---
-        # On force raw_pred à être de la soudure (1) partout où on n'est pas dans le masque
-        # Comme ça, aucune détection ne peut "fuir" à l'extérieur.
-        raw_voids = np.where(z_utile > 0, (raw_pred == 0), 0).astype(np.uint8)
+        # --- LOGIQUE INVERSÉE (Manque = Classe 1 selon votre entraînement) ---
+        # On extrait les manques (Classe 1) uniquement dans la zone utile
+        raw_voids = np.where(z_utile > 0, (raw_pred == 1), 0).astype(np.uint8)
 
-        # A. BOUCHAGE DU DESIGN INTERNE (Kernel 15x15 pour fusionner les ronds)
+        # 2. RECONSTRUCTION GÉOMÉTRIQUE (Patatoïdes)
+        # Bouchage des trous de design cuivre internes
         kernel_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         voids_closed = cv2.morphologyEx(raw_voids, cv2.MORPH_CLOSE, kernel_fill)
         
-        # Remplissage par contours pour l'aspect patatoïde
+        # Remplissage pour aspect plein
         cnts, _ = cv2.findContours(voids_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         filled_mask = np.zeros_like(raw_voids)
         for c in cnts:
             cv2.drawContours(filled_mask, [c], -1, 1, -1)
 
-        # B. FILTRAGE DES RECTANGLES DE BORDURE (Pistes)
+        # 3. FILTRAGE DES PISTES (Rectangles de bordure)
         nb_components, output, stats, _ = cv2.connectedComponentsWithStats(filled_mask, connectivity=8)
         
         final_voids = np.zeros_like(filled_mask)
@@ -96,28 +96,27 @@ if model_file:
             aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
             solidity = area / float(w * h) if (w * h) > 0 else 0
 
-            # On élimine si c'est une piste longue et rectangulaire
-            if area > 180:
+            # Filtre : ignore si c'est une piste longue et très rectangulaire
+            if area > 150:
                 if not (aspect_ratio > 3.5 and solidity > 0.85):
                     final_voids[output == i] = 1
 
-        # --- FINALISATION DES MASQUES (SÉCURITÉ TOTALE) ---
-        # valid_voids = Uniquement les manques REELS validés par la géométrie DANS le masque
+        # --- 4. MASQUAGE FINAL (SÉCURITÉ) ---
+        # On définit les zones pour l'affichage
         valid_voids = (final_voids > 0) & (z_utile > 0)
-        # valid_solder = Tout le reste du masque qui n'est pas un manque
         valid_solder = (final_voids == 0) & (z_utile > 0)
 
-        # Reconstruction de pred_map (0 = Manque, 1 = Soudure)
+        # On prépare la pred_map pour le calcul du Void Majeur (0=Manque, 1=Soudure)
         pred_map = np.ones((H, W), dtype=np.uint8)
         pred_map[valid_voids] = 0
 
-        # --- CALCULS ---
+        # --- CALCULS ET MÉTRIQUES ---
         area_total_px = np.sum(z_utile > 0)
         missing_pct = (np.sum(valid_voids) / area_total_px * 100) if area_total_px > 0 else 0
         conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-        # --- LOGIQUE VOID MAJEUR ---
+        # --- LOGIQUE DU VOID MAJEUR ---
         max_void_area = 0
         max_void_poly = None
         v_cnts, _ = cv2.findContours(valid_voids.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -129,9 +128,11 @@ if model_file:
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
         # --- AFFICHAGE OVERLAY ---
+        # L'image de base reste grise à l'extérieur du masque
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[valid_solder] = [255, 255, 0] # Jaune
-        overlay[valid_voids]  = [255, 0, 0]   # Rouge
+        overlay[valid_solder] = [255, 255, 0] # Jaune (Soudure)
+        overlay[valid_voids]  = [255, 0, 0]   # Rouge (Manque)
+        
         if max_void_poly is not None:
             cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
