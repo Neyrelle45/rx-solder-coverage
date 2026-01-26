@@ -71,39 +71,31 @@ if model_file:
         probs = clf.predict_proba(features_flat)
         
         # On extrait la probabilité de la classe "Manque" (Classe 1 selon vos labels)
-        # Un seuil de 0.4 permet de détecter les petits points jaunes plus finement
+        H, W = img_gray.shape
         void_probs = probs[:, 1].reshape(H, W)
+        conf_map = np.max(probs, axis=1).reshape(H, W)
+        
+        # Seuil à 0.4 pour capter les petits détails des labels
         raw_voids = np.where((z_utile > 0) & (void_probs > 0.4), 255, 0).astype(np.uint8)
 
-        # 2. RAFFINEMENT DES MANQUES (Basé sur vos labels)
-        # On utilise un noyau plus petit (5x5) pour garder la précision des petits points
+        # 2. RAFFINEMENT DES MANQUES (Filtre chirurgical pour petits points)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         voids_cleaned = cv2.morphologyEx(raw_voids, cv2.MORPH_OPEN, kernel) 
         voids_refined = cv2.morphologyEx(voids_cleaned, cv2.MORPH_CLOSE, kernel)
 
-        # 3. CRÉATION DES MASQUES D'AFFICHAGE
+        # 3. CRÉATION DES MASQUES D'AFFICHAGE (Bitwise pour verrouiller le masque)
         mask_bin = np.where(z_utile > 0, 255, 0).astype(np.uint8)
-        
-        # final_voids_mask = Les manques (sera affiché en ROUGE pour l'alerte)
         final_voids_mask = cv2.bitwise_and(voids_refined, voids_refined, mask=mask_bin)
-        
-        # solder_mask = La soudure (sera affichée en JAUNE pour la conformité)
         solder_mask = cv2.bitwise_and(mask_bin, cv2.bitwise_not(final_voids_mask))
 
-        # 4. CALCULS PRÉCIS
+        # 4. CALCULS DES MÉTRIQUES (Correction des NameError)
         area_total_px = np.count_nonzero(mask_bin)
         area_voids_px = np.count_nonzero(final_voids_mask)
+        
         missing_pct = (area_voids_px / area_total_px * 100) if area_total_px > 0 else 0
+        mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
         
-        # 5. OVERLAY STYLE "LABEL"
-        overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        
-        # Couleur Jaune pour la soudure (comme vos fonds de labels)
-        overlay[solder_mask > 0] = [255, 255, 0] 
-        # Couleur Rouge pour les manques (pour que ça saute aux yeux)
-        overlay[final_voids_mask > 0] = [255, 0, 0]
-
-        # 6. VOID MAJEUR (Calcul du plus gros point rouge)
+        # Identification du Void Majeur
         max_void_area = 0
         max_void_poly = None
         v_cnts, _ = cv2.findContours(final_voids_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -113,6 +105,20 @@ if model_file:
                 max_void_area = a
                 max_void_poly = v_c
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
+
+        # 5. OVERLAY STYLE FINAL
+        overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
+        
+        # On remplit les pads : Jaune pour la soudure, Rouge pour les manques
+        overlay[solder_mask > 0] = [255, 255, 0] 
+        overlay[final_voids_mask > 0] = [255, 0, 0]
+
+        if max_void_poly is not None:
+            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
+            
+        # Variables de session pour l'archivage
+        valid_solder = (solder_mask > 0)
+        valid_voids = (final_voids_mask > 0)
 
 
 
