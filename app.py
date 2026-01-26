@@ -67,84 +67,74 @@ if model_file:
 
 
         
-        # Analyse IA
+# --- ANALYSE IA INITIALE ---
         features = engine.compute_features(img_gray)
         probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
         pred_map = np.argmax(probs, axis=1).reshape(H, W)
-        conf_map = np.max(probs, axis=1).reshape(H, W)
-        mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
+        
+        # --- LOGIQUE DE RECLASSIFICATION DES PISTES ---
+        # On extrait les zones que l'IA pense être du vide (Classe 0)
+        raw_voids = (pred_map == 0) & (z_utile > 0)
+        void_cnts, _ = cv2.findContours(raw_voids.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        corrected_solder_mask = (pred_map == 1) & (z_utile > 0)
+        
+        for v_cnt in void_cnts:
+            area = cv2.contourArea(v_cnt)
+            if area < 20: continue
+            
+            # Calcul de l'allongement
+            perimeter = cv2.arcLength(v_cnt, True)
+            circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
+            rect = cv2.minAreaRect(v_cnt)
+            (w_r, h_r) = rect[1]
+            aspect_ratio = max(w_r, h_r) / (min(w_r, h_r) + 1e-5)
+            
+            # CRITÈRE PISTE : Si c'est longiligne, on force en SOUDURE (Jaune)
+            if circularity < 0.25 or aspect_ratio > 3.0:
+                cv2.drawContours(corrected_solder_mask.astype(np.uint8), [v_cnt], -1, 1, -1)
 
-        # Identification Zones
-        valid_solder = (pred_map == 1) & (z_utile > 0)
-        valid_voids = (pred_map == 0) & (z_utile > 0)
-        area_total_px = np.sum(z_utile > 0)
-        missing_pct = (1.0 - (np.sum(valid_solder) / area_total_px)) * 100.0 if area_total_px > 0 else 0
-
-# --- LOGIQUE : VOID MAJEUR ET FILTRAGE DES PISTES ---
+        # --- DÉTECTION DES VOIDS DANS LA SOUDURE CORRIGÉE ---
+        final_voids_mask = np.zeros((H, W), dtype=np.uint8)
         max_void_area = 0
         max_void_poly = None
-        
-        # Initialisation d'un masque vide pour les manques validés (Blobs + Voids)
-        # Cela permettra d'exclure visuellement et mathématiquement les pistes
-        cleaned_voids_mask = np.zeros((H, W), dtype=np.uint8)
 
-        # 1. On trouve les contours des zones de soudure (jaunes)
-        solder_u8 = valid_solder.astype(np.uint8) * 255
+        solder_u8 = (corrected_solder_mask > 0).astype(np.uint8) * 255
         solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for s_cnt in solder_cnts:
             s_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
             
-            # 2. On cherche les "trous" à l'intérieur
+            # Trous dans l'îlot (IA brute + zones non-soudure)
             inverted_s_mask = cv2.bitwise_not(solder_u8)
             holes_in_island = cv2.bitwise_and(s_mask, inverted_s_mask)
             h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             for h_cnt in h_cnts:
-                area = cv2.contourArea(h_cnt)
-                if area < 10.0: continue
-
-                # Facteurs de forme
-                perimeter = cv2.arcLength(h_cnt, True)
-                circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
-                rect = cv2.minAreaRect(h_cnt)
-                (w_r, h_r) = rect[1]
-                aspect_ratio = max(w_r, h_r) / (min(w_r, h_r) + 1e-5)
-
-                # --- FILTRE ANTI-PISTES STRICT ---
-                # On ignore les formes très allongées ET peu circulaires
-                if circularity < 0.20 and aspect_ratio > 3.0:
-                    continue 
-
-                h_mask = np.zeros((H, W), dtype=np.uint8)
-                cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
+                h_area = cv2.contourArea(h_cnt)
+                if h_area < 10: continue
                 
-                # Exclusion des zones noires (Vias)
-                if np.any((h_mask > 0) & (hol_adj > 0)):
-                    continue
+                # Exclusion des Vias
+                h_m = np.zeros((H, W), dtype=np.uint8)
+                cv2.drawContours(h_m, [h_cnt], -1, 255, -1)
+                if np.any((h_m > 0) & (hol_adj > 0)): continue
                 
-                # SI ON ARRIVE ICI : C'est un manque valide (Blob ou Void)
-                cleaned_voids_mask[h_mask > 0] = 255
-                
-                # Identification du Void Majeur (sphérique uniquement)
-                if circularity > 0.4 and area > max_void_area:
-                    max_void_area = area
+                # Si c'est un vrai trou compact (Void)
+                final_voids_mask[h_m > 0] = 255
+                if h_area > max_void_area:
+                    max_void_area = h_area
                     max_void_poly = h_cnt
 
-        # --- CALCULS FINAUX RECALIBRÉS ---
+        # --- CALCULS FINAUX ---
         area_total_px = np.sum(z_utile > 0)
-        # On base le calcul sur le masque filtré pour ignorer les pistes
-        missing_pct = (np.sum(cleaned_voids_mask > 0) / area_total_px * 100.0) if area_total_px > 0 else 0
+        missing_pct = (np.sum(final_voids_mask > 0) / area_total_px * 100.0) if area_total_px > 0 else 0
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # Overlay
+        # --- AFFICHAGE ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[valid_solder] = [255, 255, 0] # Soudure en Jaune
-        
-        # /!\ CHANGEMENT ICI : On n'affiche en rouge que les manques validés
-        overlay[cleaned_voids_mask > 0] = [255, 0, 0] 
-        
+        overlay[corrected_solder_mask > 0] = [255, 255, 0] # Tout le métal (incluant pistes) en jaune
+        overlay[final_voids_mask > 0] = [255, 0, 0]     # Voids en rouge
         if max_void_poly is not None:
             cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
