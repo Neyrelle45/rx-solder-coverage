@@ -9,7 +9,6 @@ import datetime
 import gc
 import analyse_rx_soudure as engine 
 
-
 st.set_page_config(page_title="RX Expert - Void Majeur Enclavé", layout="wide")
 
 # --- INITIALISATION ---
@@ -61,103 +60,94 @@ if model_file:
         hol_adj = cv2.warpAffine(m_black_res, M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj & ~hol_adj)
 
-
-
-
-
-
+        # --- ANALYSE IA INITIALE ---
+        features = engine.compute_features(img_gray)
+        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
+        pred_map = np.argmax(probs, axis=1).reshape(H, W)
         
-# --- LOGIQUE : VOID MAJEUR ET FILTRAGE DES PISTES ---
+        # CALCUL CONFIANCE IA
+        conf_map = np.max(probs, axis=1).reshape(H, W)
+        mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
+
+        # --- LOGIQUE DE RECLASSIFICATION DES PISTES ---
+        raw_voids = (pred_map == 0) & (z_utile > 0)
+        void_cnts, _ = cv2.findContours(raw_voids.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        corrected_solder_mask = (pred_map == 1) & (z_utile > 0)
+        
+        for v_cnt in void_cnts:
+            area = cv2.contourArea(v_cnt)
+            if area < 20: continue
+            
+            perimeter = cv2.arcLength(v_cnt, True)
+            circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
+            rect = cv2.minAreaRect(v_cnt)
+            (w_r, h_r) = rect[1]
+            aspect_ratio = max(w_r, h_r) / (min(w_r, h_r) + 1e-5)
+            
+            # Si c'est une piste (allongée), on l'ajoute au masque de soudure (Jaune)
+            if circularity < 0.25 or aspect_ratio > 3.0:
+                cv2.drawContours(corrected_solder_mask.astype(np.uint8), [v_cnt], -1, 1, -1)
+
+        # --- DÉTECTION DES VOIDS DANS LA SOUDURE CORRIGÉE ---
+        final_voids_mask = np.zeros((H, W), dtype=np.uint8)
         max_void_area = 0
         max_void_poly = None
-        
-        # Initialisation d'un masque vide pour les manques validés (Blobs + Voids)
-        # Cela permettra d'exclure visuellement et mathématiquement les pistes
-        cleaned_voids_mask = np.zeros((H, W), dtype=np.uint8)
 
-        # 1. On trouve les contours des zones de soudure (jaunes)
-        solder_u8 = valid_solder.astype(np.uint8) * 255
+        solder_u8 = (corrected_solder_mask > 0).astype(np.uint8) * 255
         solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for s_cnt in solder_cnts:
             s_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
             
-            # 2. On cherche les "trous" à l'intérieur
             inverted_s_mask = cv2.bitwise_not(solder_u8)
             holes_in_island = cv2.bitwise_and(s_mask, inverted_s_mask)
             h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             for h_cnt in h_cnts:
-                area = cv2.contourArea(h_cnt)
-                if area < 10.0: continue
-
-                # Facteurs de forme
-                perimeter = cv2.arcLength(h_cnt, True)
-                circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
-                rect = cv2.minAreaRect(h_cnt)
-                (w_r, h_r) = rect[1]
-                aspect_ratio = max(w_r, h_r) / (min(w_r, h_r) + 1e-5)
-
-                # --- FILTRE ANTI-PISTES STRICT ---
-                # On ignore les formes très allongées ET peu circulaires
-                if circularity < 0.20 and aspect_ratio > 3.0:
-                    continue 
-
-                h_mask = np.zeros((H, W), dtype=np.uint8)
-                cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
+                h_area = cv2.contourArea(h_cnt)
+                if h_area < 10: continue
                 
-                # Exclusion des zones noires (Vias)
-                if np.any((h_mask > 0) & (hol_adj > 0)):
-                    continue
+                h_m = np.zeros((H, W), dtype=np.uint8)
+                cv2.drawContours(h_m, [h_cnt], -1, 255, -1)
+                if np.any((h_m > 0) & (hol_adj > 0)): continue
                 
-                # SI ON ARRIVE ICI : C'est un manque valide (Blob ou Void)
-                cleaned_voids_mask[h_mask > 0] = 255
-                
-                # Identification du Void Majeur (sphérique uniquement)
-                if circularity > 0.4 and area > max_void_area:
-                    max_void_area = area
+                final_voids_mask[h_m > 0] = 255
+                if h_area > max_void_area:
+                    max_void_area = h_area
                     max_void_poly = h_cnt
 
-        # --- CALCULS FINAUX RECALIBRÉS ---
+        # --- CALCULS FINAUX ---
         area_total_px = np.sum(z_utile > 0)
-        # On base le calcul sur le masque filtré pour ignorer les pistes
-        missing_pct = (np.sum(cleaned_voids_mask > 0) / area_total_px * 100.0) if area_total_px > 0 else 0
+        missing_pct = (np.sum(final_voids_mask > 0) / area_total_px * 100.0) if area_total_px > 0 else 0
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # Overlay
+        # --- AFFICHAGE ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[valid_solder] = [255, 255, 0] # Soudure en Jaune
-        
-        # /!\ CHANGEMENT ICI : On n'affiche en rouge que les manques validés
-        overlay[cleaned_voids_mask > 0] = [255, 0, 0] 
-        
+        overlay[corrected_solder_mask > 0] = [255, 255, 0] # Soudure + Pistes en Jaune
+        overlay[final_voids_mask > 0] = [255, 0, 0]        # Voids réels en Rouge
         if max_void_poly is not None:
             cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
-
-
-
-
-
-        
-        # Affichage et Archivage
         st.divider()
         c_res, c_img = st.columns([1, 2])
         with c_res:
             st.metric("Manque Total", f"{missing_pct:.2f} %")
             st.metric("Void Majeur (Enclavé)", f"{max_void_pct:.3f} %")
             st.metric("Confiance IA", f"{mean_conf:.1f} %")
+            
             if st.button("📥 Archiver", use_container_width=True):
                 _, img_jpg = cv2.imencode(".jpg", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
                 st.session_state.history.append({
                     "Fichier": rx_upload.name, "Total_%": round(missing_pct, 2),
                     "Void_Max_%": round(max_void_pct, 3), "Confiance_%": round(mean_conf, 1),
                     "img_bytes": img_jpg.tobytes(), "Heure": datetime.datetime.now().strftime("%H:%M:%S")
-                }); st.toast("Archivé")
+                })
+                st.toast("Archivé")
         with c_img: st.image(overlay, use_container_width=True)
 
-# --- RAPPORT, ZIP ET GALERIE (FONCTIONS RESTAURÉES) ---
+# --- RAPPORT ET GALERIE ---
 if st.session_state.history:
     st.divider()
     df_full = pd.DataFrame(st.session_state.history)
@@ -179,5 +169,8 @@ if st.session_state.history:
             st.image(item['img_bytes'], caption=f"{item['Total_%']}%")
 
     if st.session_state.selected_img:
-        st.divider(); st.image(st.session_state.selected_img, use_container_width=True)
-        if st.button("❌ Fermer le zoom"): st.session_state.selected_img = None; st.rerun()
+        st.divider()
+        st.image(st.session_state.selected_img, use_container_width=True)
+        if st.button("❌ Fermer le zoom"): 
+            st.session_state.selected_img = None
+            st.rerun()
