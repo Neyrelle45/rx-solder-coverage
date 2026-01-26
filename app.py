@@ -80,42 +80,41 @@ if model_file:
         area_total_px = np.sum(z_utile > 0)
         missing_pct = (1.0 - (np.sum(valid_solder) / area_total_px)) * 100.0 if area_total_px > 0 else 0
 
-        # --- LOGIQUE : VOID MAJEUR ENCLAVÉ DANS LE JAUNE ---
+# --- LOGIQUE : VOID MAJEUR ET FILTRAGE DES PISTES ---
         max_void_area = 0
         max_void_poly = None
+        
+        # Initialisation d'un masque vide pour les manques validés (Blobs + Voids)
+        # Cela permettra d'exclure visuellement et mathématiquement les pistes
+        cleaned_voids_mask = np.zeros((H, W), dtype=np.uint8)
 
         # 1. On trouve les contours des zones de soudure (jaunes)
         solder_u8 = valid_solder.astype(np.uint8) * 255
         solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for s_cnt in solder_cnts:
-            # Pour chaque îlot de soudure, on crée un masque
             s_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
             
-            # 2. On cherche les "trous" à l'intérieur de cet îlot
-            # Un trou est une zone qui n'est pas de la soudure MAIS qui est dans le périmètre de l'îlot
+            # 2. On cherche les "trous" à l'intérieur
             inverted_s_mask = cv2.bitwise_not(solder_u8)
             holes_in_island = cv2.bitwise_and(s_mask, inverted_s_mask)
-            
             h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             for h_cnt in h_cnts:
                 area = cv2.contourArea(h_cnt)
                 if area < 10.0: continue
 
-                # --- CALCUL DES FACTEURS DE FORME ---
+                # Facteurs de forme
                 perimeter = cv2.arcLength(h_cnt, True)
                 circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
-                
-                # Récupération du ratio d'aspect via le rectangle englobant minimal
                 rect = cv2.minAreaRect(h_cnt)
                 (w_r, h_r) = rect[1]
-                aspect_ratio = max(w_r, h_r) / min(w_r, h_r) if min(w_r, h_r) > 0 else 10
+                aspect_ratio = max(w_r, h_r) / (min(w_r, h_r) + 1e-5)
 
-                # --- CRITÈRE D'EXCLUSION DES PISTES (Formes allongées et fines) ---
-                # Les pistes sont peu circulaires ET très allongées
-                if circularity < 0.25 and aspect_ratio > 3.0:
+                # --- FILTRE ANTI-PISTES STRICT ---
+                # On ignore les formes très allongées ET peu circulaires
+                if circularity < 0.20 and aspect_ratio > 3.0:
                     continue 
 
                 h_mask = np.zeros((H, W), dtype=np.uint8)
@@ -124,18 +123,16 @@ if model_file:
                 # Exclusion des zones noires (Vias)
                 if np.any((h_mask > 0) & (hol_adj > 0)):
                     continue
-
+                
                 # SI ON ARRIVE ICI : C'est un manque valide (Blob ou Void)
                 cleaned_voids_mask[h_mask > 0] = 255
                 
-                # --- IDENTIFICATION DU VOID MAJEUR ---
-                # On ne considère comme "Void Majeur" que ce qui est relativement compact
-                # pour éviter qu'une barre de bordure ne devienne le "Void Max"
+                # Identification du Void Majeur (sphérique uniquement)
                 if circularity > 0.4 and area > max_void_area:
                     max_void_area = area
                     max_void_poly = h_cnt
-                    
-# --- CALCULS FINAUX RECALIBRÉS ---
+
+        # --- CALCULS FINAUX RECALIBRÉS ---
         area_total_px = np.sum(z_utile > 0)
         # On base le calcul sur le masque filtré pour ignorer les pistes
         missing_pct = (np.sum(cleaned_voids_mask > 0) / area_total_px * 100.0) if area_total_px > 0 else 0
