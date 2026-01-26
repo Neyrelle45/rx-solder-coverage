@@ -71,23 +71,24 @@ if model_file:
         probs = clf.predict_proba(features_flat)
         
         H, W = img_gray.shape
-        # Vos labels : Classe 1 = Manque (Jaune), Classe 0 = Soudure (Rouge)
-        # On extrait la probabilité de Manque
+        # Classe 1 = Manque (Jaune dans vos labels), Classe 0 = Soudure (Rouge dans vos labels)
         void_probs = probs[:, 1].reshape(H, W)
+        conf_map = np.max(probs, axis=1).reshape(H, W)
         
+        # --- CALCUL DE LA CONFIANCE (Pour corriger l'erreur NameError) ---
+        mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
+
         # --- SÉCURITÉ : REMPLISSAGE TOTAL ---
-        # On définit le masque binaire de la zone verte uniquement
         mask_bin = (z_utile > 0).astype(np.uint8)
 
-        # 2. Détection des manques (Voids)
-        # On baisse le seuil à 0.15 pour être très sensible comme sur vos labels
+        # 2. Détection des manques (Sensibilité augmentée à 0.15)
         raw_voids = ((void_probs > 0.15) & (mask_bin > 0)).astype(np.uint8)
         
-        # Nettoyage morphologique : on bouche les petits trous internes au rouge
+        # Fermeture pour boucher les petits trous de design cuivre
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         voids_filled = cv2.morphologyEx(raw_voids, cv2.MORPH_CLOSE, kernel)
 
-        # 3. Filtrage Géométrique Strict (Ratio & Enclavement)
+        # 3. Filtrage Géométrique Strict
         nb_components, output, stats, _ = cv2.connectedComponentsWithStats(voids_filled, connectivity=8)
         
         final_voids_mask = np.zeros_like(voids_filled)
@@ -99,38 +100,35 @@ if model_file:
             w, h = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
             aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
 
-            # --- CONDITION 3 : Ratio d'aspect (Bandes) ---
-            # Si c'est trop long (piste), on ignore
+            # --- CONDITION : Ratio (Bandes) ---
             if aspect_ratio > 3.0:
                 continue
 
-            # --- CONDITION 2 : Enclavement ---
-            # On vérifie si le manque touche le bord du masque vert
+            # --- CONDITION : Enclavement ---
             comp_mask = (output == i).astype(np.uint8)
-            # Dilatation pour voir si on touche le "hors-masque"
-            dilated = cv2.dilate(comp_mask, kernel, iterations=1)
+            # On vérifie si une dilatation touche l'extérieur du masque vert
+            dilated = cv2.dilate(comp_mask, kernel, iterations=2)
             touches_border = np.any((dilated > 0) & (mask_bin == 0))
 
-            # On accepte si c'est enclavé OU si c'est un très gros manque (bulle centrale)
-            if not touches_border or area > 400:
+            if not touches_border:
                 final_voids_mask[output == i] = 1
                 if area > max_void_area:
                     max_void_area = area
                     v_cnts, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if v_cnts: max_void_poly = v_cnts[0]
 
-        # 4. Calculs et Affichage (Pas de points noirs)
+        # 4. Métriques finales
         area_total_px = np.count_nonzero(mask_bin)
         missing_pct = (np.count_nonzero(final_voids_mask) / area_total_px * 100) if area_total_px > 0 else 0
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # --- LOGIQUE COULEUR : SOUDURE JAUNE / MANQUE ROUGE ---
+        # --- AFFICHAGE : SOUDURE JAUNE / MANQUE ROUGE ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         
-        # On colorie TOUT le masque en JAUNE d'abord (Soudure)
+        # On remplit tout le masque vert en JAUNE d'abord
         overlay[mask_bin > 0] = [255, 255, 0]
         
-        # On colorie par dessus les MANQUES en ROUGE
+        # On ajoute les MANQUES ENCLAVÉS en ROUGE par-dessus
         overlay[final_voids_mask > 0] = [255, 0, 0]
         
         if max_void_poly is not None:
