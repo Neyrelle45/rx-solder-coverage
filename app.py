@@ -73,18 +73,17 @@ if model_file:
         
         # --- VERROUILLAGE SÉCURITÉ ---
         # On crée une map propre : Classe 1 (Manque) uniquement SI dans z_utile
-        # Tout le reste (hors masque) devient 0 (Soudure/Fond)
         voids_base = np.zeros((H, W), dtype=np.uint8)
         voids_base[(z_utile > 0) & (raw_pred == 1)] = 1
 
         # 2. RECONSTRUCTION (Patatoïdes)
-        # On ferme les trous créés par le design cuivre interne (Kernel 15x15)
+        # On ferme les trous du design cuivre (Kernel 15x15)
         kernel_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         voids_closed = cv2.morphologyEx(voids_base, cv2.MORPH_CLOSE, kernel_fill)
         
-        # Remplissage des contours pour un aspect plein et propre
+        # Correction de l'erreur : on initialise BIEN filled_mask avant la boucle
         cnts, _ = cv2.findContours(voids_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        filled_voids = np.zeros_like(voids_base)
+        filled_mask = np.zeros((H, W), dtype=np.uint8)
         for c in cnts:
             cv2.drawContours(filled_mask, [c], -1, 1, -1)
 
@@ -98,13 +97,13 @@ if model_file:
             aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
             solidity = area / float(w * h) if (w * h) > 0 else 0
 
-            # On élimine si c'est une piste longue et rectangulaire
+            # Filtre anti-pistes (longues et pleines)
             if area > 180:
-                if not (aspect_ratio > 3.5 and solidity > 0.85):
+                if not (aspect_ratio > 3.2 and solidity > 0.82):
                     cleaned_voids[output == i] = 1
 
         # --- 4. MASQUAGE FINAL (VERROU ABSOLU) ---
-        # On s'assure qu'AUCUN pixel ne survit hors du masque vert
+        # On s'assure qu'aucun pixel ne survit hors du masque vert
         valid_voids = (cleaned_voids > 0) & (z_utile > 0)
         valid_solder = (cleaned_voids == 0) & (z_utile > 0)
 
@@ -112,18 +111,29 @@ if model_file:
         pred_map = np.ones((H, W), dtype=np.uint8)
         pred_map[valid_voids] = 0
 
-        # --- CALCULS ---
+        # --- CALCULS ET MÉTRIQUES ---
         area_total_px = np.sum(z_utile > 0)
         missing_pct = (np.sum(valid_voids) / area_total_px * 100) if area_total_px > 0 else 0
-        
-        # --- AFFICHAGE OVERLAY ---
-        # L'image originale sert de fond (grise)
-        overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        
-        # On n'applique les couleurs QUE sur les pixels du masque
-        overlay[valid_solder] = [255, 255, 0] # JAUNE pour la soudure
-        overlay[valid_voids]  = [255, 0, 0]   # ROUGE pour le manque
+        conf_map = np.max(probs, axis=1).reshape(H, W)
+        mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
+        # --- LOGIQUE VOID MAJEUR ---
+        max_void_area = 0
+        max_void_poly = None
+        v_cnts, _ = cv2.findContours(valid_voids.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for v_c in v_cnts:
+            a = cv2.contourArea(v_c)
+            if a > max_void_area:
+                max_void_area = a
+                max_void_poly = v_c
+        max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
+
+        # --- AFFICHAGE OVERLAY ---
+        overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
+        overlay[valid_solder] = [255, 255, 0] # JAUNE
+        overlay[valid_voids]  = [255, 0, 0]   # ROUGE
+        if max_void_poly is not None:
+            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
 
 
