@@ -104,10 +104,6 @@ if model_file:
                 area = cv2.contourArea(h_cnt)
                 if area < 10.0: continue
 
-for h_cnt in h_cnts:
-                area = cv2.contourArea(h_cnt)
-                if area < 10.0: continue
-
                 # --- CALCUL DES FACTEURS DE FORME ---
                 perimeter = cv2.arcLength(h_cnt, True)
                 circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
