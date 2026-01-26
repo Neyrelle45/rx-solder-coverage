@@ -94,7 +94,7 @@ def compute_features(img: np.ndarray) -> np.ndarray:
     
     # 1. Intensités de base
     f_int = imgf / 255.0
-    f_clahe = engine.apply_clahe(img) / 255.0 # Utilise la fonction de ton engine
+    f_clahe = apply_clahe(img) / 255.0 # Utilise la fonction de ton engine
     
     # 2. Gradients optimisés pour les bords droits (Scharr)
     # Scharr est plus sensible aux lignes droites que Sobel
