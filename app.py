@@ -65,31 +65,29 @@ if model_file:
 
 
         
-# 1. Analyse IA initiale
+# 1. Analyse IA avec sensibilité accrue
         features = engine.compute_features(img_gray)
         features_flat = features.reshape(-1, features.shape[-1])
         probs = clf.predict_proba(features_flat)
         
-        # Identification du manque (Classe 1 dans votre entraînement)
         H, W = img_gray.shape
         void_probs = probs[:, 1].reshape(H, W)
         conf_map = np.max(probs, axis=1).reshape(H, W)
         
-        # 2. Masquage de base (Verrouillage sur zone verte)
+        # 2. Masque effectif (Verrouillage Vert - Vias Noirs)
         mask_bin = np.where(z_utile > 0, 255, 0).astype(np.uint8)
-        # On exclut aussi les zones noires (trous de vias/design) à l'intérieur du masque
-        # en supposant que img_gray est très sombre (< 30) dans ces zones
-        mask_vias = np.where(img_gray < 30, 0, 1).astype(np.uint8)
-        effective_mask = cv2.bitwise_and(mask_bin, mask_bin, mask=mask_vias)
+        # On définit les vias/trous noirs par seuillage bas sur l'image RX
+        _, mask_vias = cv2.threshold(img_gray, 40, 255, cv2.THRESH_BINARY)
+        effective_mask = cv2.bitwise_and(mask_bin, mask_vias)
 
-        # 3. Filtrage des Manques (Voids)
-        raw_voids = np.where((effective_mask > 0) & (void_probs > 0.5), 255, 0).astype(np.uint8)
+        # 3. Détection des manques (Seuil abaissé à 0.20 pour plus de sensibilité)
+        raw_voids = np.where((effective_mask > 0) & (void_probs > 0.20), 255, 0).astype(np.uint8)
         
-        # Nettoyage morphologique léger pour garder les détails
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        voids_cleaned = cv2.morphologyEx(raw_voids, cv2.MORPH_OPEN, kernel)
+        # Nettoyage très léger pour ne pas perdre les petits points
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        voids_cleaned = cv2.morphologyEx(raw_voids, cv2.MORPH_OPEN, kernel_small)
 
-        # 4. Logique d'exclusion des bandes et calcul du Void Majeur
+        # 4. Filtrage Géométrique et Enclavement
         nb_components, output, stats, _ = cv2.connectedComponentsWithStats(voids_cleaned, connectivity=8)
         
         final_voids_mask = np.zeros_like(voids_cleaned)
@@ -97,42 +95,48 @@ if model_file:
         max_void_poly = None
 
         for i in range(1, nb_components):
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
             area = stats[i, cv2.CC_STAT_AREA]
-            
-            # --- CONDITION 3 : Ratio d'aspect (Bandes) ---
+            w, h = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
             aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
-            if aspect_ratio > 3.5:
-                continue # On ignore les formes de type "bande"
 
-            # --- CONDITION 2 : Enclavement strict ---
-            # On vérifie si le composant touche le bord du masque ou un via noir
-            component_mask = (output == i).astype(np.uint8)
-            dilated_comp = cv2.dilate(component_mask, kernel, iterations=1)
-            # Si la dilatation touche une zone hors masque, il n'est pas "enclavé"
-            touches_border = np.any((dilated_comp > 0) & (effective_mask == 0))
+            # Filtre de bande (Condition 3)
+            if aspect_ratio > 3.0 and area > 100:
+                continue
 
-            if not touches_border:
+            # Vérification de l'enclavement (Condition 2)
+            # On vérifie si le manque touche le bord du masque effectif
+            comp_mask = (output == i).astype(np.uint8)
+            # On cherche les pixels de bordure du composant
+            contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            is_enclaved = True
+            if contours:
+                for pt in contours[0]:
+                    x, y = pt[0]
+                    # Si un point du contour est trop proche d'un pixel noir du masque
+                    # on considère qu'il n'est pas enclavé (marge de 1px)
+                    if effective_mask[y, x] == 0:
+                        is_enclaved = False
+                        break
+            
+            if is_enclaved or area > 500: # On garde les gros voids même si proches bords
                 final_voids_mask[output == i] = 255
-                # Calcul du Void Majeur parmis les enclavés
                 if area > max_void_area:
                     max_void_area = area
-                    v_cnts, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if v_cnts: max_void_poly = v_cnts[0]
+                    max_void_poly = contours[0] if contours else None
 
-        # 5. Calculs et Affichage (COULEURS INVERSÉES)
+        # 5. Métriques et Affichage
         area_total_px = np.count_nonzero(effective_mask)
         missing_pct = (np.count_nonzero(final_voids_mask) / area_total_px * 100) if area_total_px > 0 else 0
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-        # Masque pour la soudure (Tout le masque effectif - les manques rouges)
+        # Masque Jaune (Soudure) = Masque Vert - Voids Rouges
         solder_mask = cv2.bitwise_and(effective_mask, cv2.bitwise_not(final_voids_mask))
 
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[solder_mask > 0] = [255, 255, 0]      # JAUNE = Soudure
-        overlay[final_voids_mask > 0] = [255, 0, 0]   # ROUGE = Manque
+        overlay[solder_mask > 0] = [255, 255, 0]    # JAUNE
+        overlay[final_voids_mask > 0] = [255, 0, 0] # ROUGE
         
         if max_void_poly is not None:
             cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 2)
