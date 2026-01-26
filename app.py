@@ -64,29 +64,32 @@ if model_file:
         features = engine.compute_features(img_gray)
         features_flat = features.reshape(-1, features.shape[-1])
         probs = clf.predict_proba(features_flat)
-        
-        # --- PATCH ANTI-BRUIT GÉOMÉTRIQUE ---
         raw_pred = np.argmax(probs, axis=1).reshape(H, W)
-        conf_map = np.max(probs, axis=1).reshape(H, W)
-
-        # On filtre la map des "manques" (classe 0) pour supprimer les artefacts fins (pistes)
-        # Inversion pour travailler sur les manques (0 -> 1)
+        
+        # --- FILTRAGE GÉOMÉTRIQUE AVANCÉ ---
         voids_mask = (raw_pred == 0).astype(np.uint8)
-
-        # On élimine les objets trop petits ou trop fins (pistes, bruit de bordure)
-        # connectivity=8 permet de bien lier les pixels en diagonale
-        nb_components, output, stats, _ = cv2.connectedComponentsWithStats(voids_mask, connectivity=8)
-
+        nb_components, output, stats, centroids = cv2.connectedComponentsWithStats(voids_mask, connectivity=8)
+        
         cleaned_voids = np.zeros_like(voids_mask)
         for i in range(1, nb_components):
-            # Seuil de 150 pixels : assez gros pour un void, trop petit pour une piste parasite
-            if stats[i, cv2.CC_STAT_AREA] >= 150: 
+            area = stats[i, cv2.CC_STAT_AREA]
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            
+            # Calcul de l'allongement (ratio largeur/hauteur)
+            aspect_ratio = max(w, h) / min(w, h)
+            
+            # CRITÈRES DE VALIDATION D'UN VOID :
+            # 1. Surface minimum (ignore le bruit de grain)
+            # 2. Pas trop allongé (ignore les pistes de cuivre et bords de composants)
+            if area >= 120 and aspect_ratio < 2.5:
                 cleaned_voids[output == i] = 1
 
-        # On reconstruit la pred_map finale : 0 là où c'est un vrai void, 1 sinon (soudure)
+        # Mise à jour de la map finale
         pred_map = np.ones_like(raw_pred)
-        pred_map[cleaned_voids == 1] = 0 
-        # ------------------------------------
+        pred_map[cleaned_voids == 1] = 0
+        
+        conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
         # Identification Zones
