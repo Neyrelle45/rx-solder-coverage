@@ -124,6 +124,9 @@ if model_file:
                 # Exclusion des zones noires (Vias)
                 if np.any((h_mask > 0) & (hol_adj > 0)):
                     continue
+
+                # SI ON ARRIVE ICI : C'est un manque valide (Blob ou Void)
+                cleaned_voids_mask[h_mask > 0] = 255
                 
                 # --- IDENTIFICATION DU VOID MAJEUR ---
                 # On ne considère comme "Void Majeur" que ce qui est relativement compact
