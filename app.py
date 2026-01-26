@@ -65,74 +65,62 @@ if model_file:
 
 
         
-# 1. Analyse IA initiale
+ # Analyse IA
         features = engine.compute_features(img_gray)
-        features_flat = features.reshape(-1, features.shape[-1])
-        probs = clf.predict_proba(features_flat)
-        
-        H, W = img_gray.shape
-        # Classe 1 = Manque (Jaune dans vos labels), Classe 0 = Soudure (Rouge dans vos labels)
-        void_probs = probs[:, 1].reshape(H, W)
+        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
+        pred_map = np.argmax(probs, axis=1).reshape(H, W)
         conf_map = np.max(probs, axis=1).reshape(H, W)
-        
-        # --- CALCUL DE LA CONFIANCE (Pour corriger l'erreur NameError) ---
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-        # --- SÉCURITÉ : REMPLISSAGE TOTAL ---
-        mask_bin = (z_utile > 0).astype(np.uint8)
+        # Identification Zones
+        valid_solder = (pred_map == 1) & (z_utile > 0)
+        valid_voids = (pred_map == 0) & (z_utile > 0)
+        area_total_px = np.sum(z_utile > 0)
+        missing_pct = (1.0 - (np.sum(valid_solder) / area_total_px)) * 100.0 if area_total_px > 0 else 0
 
-        # 2. Détection des manques (Sensibilité augmentée à 0.15)
-        raw_voids = ((void_probs > 0.15) & (mask_bin > 0)).astype(np.uint8)
-        
-        # Fermeture pour boucher les petits trous de design cuivre
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        voids_filled = cv2.morphologyEx(raw_voids, cv2.MORPH_CLOSE, kernel)
-
-        # 3. Filtrage Géométrique Strict
-        nb_components, output, stats, _ = cv2.connectedComponentsWithStats(voids_filled, connectivity=8)
-        
-        final_voids_mask = np.zeros_like(voids_filled)
+        # --- LOGIQUE : VOID MAJEUR ENCLAVÉ DANS LE JAUNE ---
         max_void_area = 0
         max_void_poly = None
 
-        for i in range(1, nb_components):
-            area = stats[i, cv2.CC_STAT_AREA]
-            w, h = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
-            aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
+        # 1. On trouve les contours des zones de soudure (jaunes)
+        solder_u8 = valid_solder.astype(np.uint8) * 255
+        solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            # --- CONDITION : Ratio (Bandes) ---
-            if aspect_ratio > 3.0:
-                continue
-
-            # --- CONDITION : Enclavement ---
-            comp_mask = (output == i).astype(np.uint8)
-            # On vérifie si une dilatation touche l'extérieur du masque vert
-            dilated = cv2.dilate(comp_mask, kernel, iterations=2)
-            touches_border = np.any((dilated > 0) & (mask_bin == 0))
-
-            if not touches_border:
-                final_voids_mask[output == i] = 1
+        for s_cnt in solder_cnts:
+            # Pour chaque îlot de soudure, on crée un masque
+            s_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
+            
+            # 2. On cherche les "trous" à l'intérieur de cet îlot
+            # Un trou est une zone qui n'est pas de la soudure MAIS qui est dans le périmètre de l'îlot
+            inverted_s_mask = cv2.bitwise_not(solder_u8)
+            holes_in_island = cv2.bitwise_and(s_mask, inverted_s_mask)
+            
+            h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for h_cnt in h_cnts:
+                area = cv2.contourArea(h_cnt)
+                if area < 10.0: continue
+                
+                h_mask = np.zeros((H, W), dtype=np.uint8)
+                cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
+                
+                # CRITÈRE D'EXCLUSION : Ne doit pas contenir de zone noire (via/non inspecté)
+                if np.any((h_mask > 0) & (hol_adj > 0)):
+                    continue
+                
                 if area > max_void_area:
                     max_void_area = area
-                    v_cnts, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if v_cnts: max_void_poly = v_cnts[0]
+                    max_void_poly = h_cnt
 
-        # 4. Métriques finales
-        area_total_px = np.count_nonzero(mask_bin)
-        missing_pct = (np.count_nonzero(final_voids_mask) / area_total_px * 100) if area_total_px > 0 else 0
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # --- AFFICHAGE : SOUDURE JAUNE / MANQUE ROUGE ---
+        # Overlay
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        
-        # On remplit tout le masque vert en JAUNE d'abord
-        overlay[mask_bin > 0] = [255, 255, 0]
-        
-        # On ajoute les MANQUES ENCLAVÉS en ROUGE par-dessus
-        overlay[final_voids_mask > 0] = [255, 0, 0]
-        
+        overlay[valid_solder] = [255, 255, 0]
+        overlay[valid_voids] = [255, 0, 0]
         if max_void_poly is not None:
-            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 2)
+            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
 
 
