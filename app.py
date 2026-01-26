@@ -60,51 +60,51 @@ if model_file:
         hol_adj = cv2.warpAffine(m_black_res, M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj & ~hol_adj)
 
-        # Analyse IA
+# 1. Analyse IA initiale
         features = engine.compute_features(img_gray)
         features_flat = features.reshape(-1, features.shape[-1])
         probs = clf.predict_proba(features_flat)
         raw_pred = np.argmax(probs, axis=1).reshape(H, W)
         
-# --- PATCH GÉOMÉTRIE AVANCÉE v2 ---
-        voids_mask = (raw_pred == 0).astype(np.uint8)
+        # 2. ISOLATION ET RECONSTRUCTION (Capture des patatoïdes)
+        # On extrait les manques détectés (0)
+        voids_raw = (raw_pred == 0).astype(np.uint8)
         
-        # Érosion légère pour détacher les pistes collées aux bords
-        kernel_detach = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        voids_mask = cv2.erode(voids_mask, kernel_detach, iterations=1)
+        # Fermeture morphologique large pour fusionner les zones rouges séparées par le design cuivre
+        # Cela crée les "blocs" de manques avant de tester leur forme
+        kernel_reconstruct = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        voids_filled = cv2.morphologyEx(voids_raw, cv2.MORPH_CLOSE, kernel_reconstruct)
 
-        nb_components, output, stats, centroids = cv2.connectedComponentsWithStats(voids_mask, connectivity=8)
+        # 3. FILTRAGE GÉOMÉTRIQUE (Élimination des pistes de bordure)
+        nb_components, output, stats, _ = cv2.connectedComponentsWithStats(voids_filled, connectivity=8)
         
-        cleaned_voids = np.zeros_like(voids_mask)
+        cleaned_voids = np.zeros_like(voids_filled)
         for i in range(1, nb_components):
             area = stats[i, cv2.CC_STAT_AREA]
             w = stats[i, cv2.CC_STAT_WIDTH]
             h = stats[i, cv2.CC_STAT_HEIGHT]
             
-            # Calcul de la circularité réelle (Périmètre² / 4π * Aire)
-            # Un cercle = 1, une ligne = beaucoup plus
-            aspect_ratio = max(w, h) / min(w, h)
+            # Calcul de l'allongement
+            aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
             
-            # FILTRE : On ignore les formes très allongées (pistes) ou trop petites
-            if area >= 150 and aspect_ratio < 2.2:
+            # CRITÈRES : 
+            # - On garde les formes qui ne sont pas des lignes infinies (ratio < 4.0)
+            # - On garde ce qui a une taille significative
+            if area > 120 and aspect_ratio < 4.0:
                 cleaned_voids[output == i] = 1
 
-        # Redonner leur taille aux voids après l'érosion (Dilatation)
-        cleaned_voids = cv2.dilate(cleaned_voids, kernel_detach, iterations=1)
-
-# --- RECONSTRUCTION DES VOIDS (BOUCHAGE DES TROUS INTERNES) ---
-        # On utilise une fermeture pour lier les parties d'un manque séparées par du cuivre
-        kernel_fill = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        cleaned_voids = cv2.morphologyEx(cleaned_voids, cv2.MORPH_CLOSE, kernel_fill)
-        
-        # On remplit les contours pour assurer une forme pleine (sphéroïde)
+        # 4. REMPLISSAGE FINAL (Assurer l'aspect plein)
         cnts, _ = cv2.findContours(cleaned_voids, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in cnts:
             cv2.drawContours(cleaned_voids, [c], -1, 1, -1)
 
-        # Mise à jour de la map finale
-        pred_map = np.ones_like(raw_pred)
-        pred_map[cleaned_voids == 1] = 0
+        # Application du masque de zone utile
+        valid_voids = (cleaned_voids > 0) & (z_utile > 0)
+        valid_solder = (cleaned_voids == 0) & (z_utile > 0)
+        
+        # Mise à jour des maps pour l'affichage
+        pred_map = np.ones((H, W), dtype=np.uint8)
+        pred_map[valid_voids] = 0
         
 
         # Mise à jour de la map finale
