@@ -62,7 +62,8 @@ if model_file:
 
         # Analyse IA
         features = engine.compute_features(img_gray)
-        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
+        features_flat = features.reshape(-1, features.shape[-1])
+        probs = clf.predict_proba(features_flat)
         pred_map = np.argmax(probs, axis=1).reshape(H, W)
         conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
