@@ -89,6 +89,8 @@ def apply_clahe(img: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8))
 
 def compute_features(img: np.ndarray) -> np.ndarray:
     img = cv2.medianBlur(img, 5)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    img = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
     imgf = img.astype(np.float32)
     f_int = imgf / 255.0
     f_clahe = apply_clahe(img) / 255.0
@@ -530,7 +532,7 @@ def train_model(images_dir: str, labels_dir: str, models_dir: str = "./MyDrive/O
         raise RuntimeError("Aucun pixel labelisé trouvé. Ajoute des scribbles rouge/jaune dans ./MyDrive/OBC_mainboard/labels.")
 
     X = np.vstack(Xs); y = np.concatenate(ys)
-    clf = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, class_weight="balanced", random_state=42, max_depth=12, min_samples_leaf=50).fit(X, y)
+    clf = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, class_weight="balanced", random_state=42, max_depth=10, min_samples_leaf=100).fit(X, y)
 
     yp = clf.predict(X)
     print("=== Rapport d'entraînement (indicatif) ===")
