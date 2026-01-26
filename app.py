@@ -65,34 +65,41 @@ if model_file:
 
 
         
- # Analyse IA
+# --- 1. ANALYSE IA ---
         features = engine.compute_features(img_gray)
-        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
+        features_flat = features.reshape(-1, features.shape[-1])
+        probs = clf.predict_proba(features_flat)
+        
+        # Classe 1 = Manque (Jaune labels), Classe 0 = Soudure (Rouge labels)
         pred_map = np.argmax(probs, axis=1).reshape(H, W)
         conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-        # Identification Zones
-        valid_solder = (pred_map == 1) & (z_utile > 0)
-        valid_voids = (pred_map == 0) & (z_utile > 0)
-        area_total_px = np.sum(z_utile > 0)
-        missing_pct = (1.0 - (np.sum(valid_solder) / area_total_px)) * 100.0 if area_total_px > 0 else 0
+        # --- 2. IDENTIFICATION DES ZONES (Soudure vs Manque Brut) ---
+        # On définit la soudure valide (Classe 0)
+        valid_solder = (pred_map == 0) & (z_utile > 0)
+        
+        # On définit les manques bruts (Classe 1)
+        raw_voids = (pred_map == 1) & (z_utile > 0)
 
-        # --- LOGIQUE : VOID MAJEUR ENCLAVÉ DANS LE JAUNE ---
+        # --- 3. LOGIQUE VOID MAJEUR ET FILTRAGE GÉOMÉTRIQUE ---
         max_void_area = 0
         max_void_poly = None
+        
+        # On crée une map propre pour les manques filtrés (pour l'affichage rouge)
+        # On l'initialise à 0 pour ne rien afficher par défaut
+        cleaned_voids = np.zeros((H, W), dtype=np.bool_)
 
-        # 1. On trouve les contours des zones de soudure (jaunes)
+        # On trouve les contours des zones de soudure (ce qui deviendra jaune)
         solder_u8 = valid_solder.astype(np.uint8) * 255
         solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for s_cnt in solder_cnts:
-            # Pour chaque îlot de soudure, on crée un masque
+            # Masque de l'îlot de soudure actuel
             s_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
             
-            # 2. On cherche les "trous" à l'intérieur de cet îlot
-            # Un trou est une zone qui n'est pas de la soudure MAIS qui est dans le périmètre de l'îlot
+            # On cherche les zones "vides" à l'intérieur de cet îlot
             inverted_s_mask = cv2.bitwise_not(solder_u8)
             holes_in_island = cv2.bitwise_and(s_mask, inverted_s_mask)
             
@@ -100,25 +107,50 @@ if model_file:
             
             for h_cnt in h_cnts:
                 area = cv2.contourArea(h_cnt)
-                if area < 10.0: continue
+                if area < 15.0: continue # Filtre petit bruit
                 
+                # --- FILTRE BANDE (Ratio d'aspect) ---
+                rect = cv2.minAreaRect(h_cnt)
+                (x, y), (w, h), angle = rect
+                aspect_ratio = max(w, h) / (min(w, h) + 1e-5)
+                if aspect_ratio > 3.5: # On ignore les formes type "bande"
+                    continue
+
                 h_mask = np.zeros((H, W), dtype=np.uint8)
                 cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
                 
-                # CRITÈRE D'EXCLUSION : Ne doit pas contenir de zone noire (via/non inspecté)
+                # --- CONDITION ENCLAVEMENT STRICT ---
+                # 1. Ne doit pas toucher le bord du masque vert (env_adj)
+                # On dilate légèrement le trou pour voir s'il "mord" sur le fond
+                dilated_h = cv2.dilate(h_mask, np.ones((3,3), np.uint8), iterations=1)
+                if np.any((dilated_h > 0) & (env_adj == 0)):
+                    continue 
+
+                # 2. Ne doit pas toucher une zone noire (hol_adj / Vias)
                 if np.any((h_mask > 0) & (hol_adj > 0)):
                     continue
+                
+                # Si on arrive ici, le void est valide
+                cleaned_voids[h_mask > 0] = True
                 
                 if area > max_void_area:
                     max_void_area = area
                     max_void_poly = h_cnt
 
+        # --- 4. CALCULS FINAUX ET OVERLAY ---
+        area_total_px = np.sum(z_utile > 0)
+        # Le manque total est la somme de tous les voids validés
+        missing_pct = (np.sum(cleaned_voids) / area_total_px * 100.0) if area_total_px > 0 else 0
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # Overlay
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
+        
+        # Colorisation
+        # La soudure est en jaune (Classe 0)
         overlay[valid_solder] = [255, 255, 0]
-        overlay[valid_voids] = [255, 0, 0]
+        # Les manques validés sont en rouge (Extraits de la Classe 1 et filtrés)
+        overlay[cleaned_voids] = [255, 0, 0]
+        
         if max_void_poly is not None:
             cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
 
