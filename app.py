@@ -65,70 +65,79 @@ if model_file:
         probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
         pred_map = np.argmax(probs, axis=1).reshape(H, W)
         
-        # CALCUL CONFIANCE IA
+# --- 1. PRÉDICTION IA BRUTE ---
+        features = engine.compute_features(img_gray)
+        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
+        pred_map = np.argmax(probs, axis=1).reshape(H, W)
         conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-        # --- LOGIQUE DE RECLASSIFICATION DES PISTES ---
-        raw_voids = (pred_map == 0) & (z_utile > 0)
-        void_cnts, _ = cv2.findContours(raw_voids.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # --- 2. RECLASSIFICATION GÉOMÉTRIQUE DES PISTES (FORCE JAUNE) ---
+        # On récupère tout ce que l'IA voit comme "vide" (0) dans la zone utile
+        potential_tracks = (pred_map == 0) & (z_utile > 0)
+        tracks_cnts, _ = cv2.findContours(potential_tracks.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        corrected_solder_mask = (pred_map == 1) & (z_utile > 0)
-        
-        for v_cnt in void_cnts:
-            area = cv2.contourArea(v_cnt)
-            if area < 20: continue
+        # Masque final de soudure (on part de la prédiction IA classe 1)
+        valid_solder = (pred_map == 1) & (z_utile > 0)
+
+        for t_cnt in tracks_cnts:
+            area = cv2.contourArea(t_cnt)
+            if area < 50: continue # Ignore le bruit
             
-            perimeter = cv2.arcLength(v_cnt, True)
-            circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
-            rect = cv2.minAreaRect(v_cnt)
+            # Calcul de l'allongement (Ratio d'aspect)
+            rect = cv2.minAreaRect(t_cnt)
             (w_r, h_r) = rect[1]
             aspect_ratio = max(w_r, h_r) / (min(w_r, h_r) + 1e-5)
             
-            # Si c'est une piste (allongée), on l'ajoute au masque de soudure (Jaune)
-            if circularity < 0.25 or aspect_ratio > 3.0:
-                cv2.drawContours(corrected_solder_mask.astype(np.uint8), [v_cnt], -1, 1, -1)
+            # CRITÈRE : Si c'est un rectangle long (> 3.0), c'est une piste -> JAUNE
+            if aspect_ratio > 3.0:
+                cv2.drawContours(valid_solder.astype(np.uint8), [t_cnt], -1, 1, -1)
+                # On met à jour valid_solder pour inclure cette zone
+                valid_solder = valid_solder | (cv2.drawContours(np.zeros_like(valid_solder, dtype=np.uint8), [t_cnt], -1, 1, -1) > 0)
 
-        # --- DÉTECTION DES VOIDS DANS LA SOUDURE CORRIGÉE ---
+        # --- 3. DÉTECTION DES VOIDS (DANS TOUTES LES ZONES JAUNES) ---
+        # Maintenant que les pistes sont jaunes, on cherche les trous dedans
         final_voids_mask = np.zeros((H, W), dtype=np.uint8)
         max_void_area = 0
         max_void_poly = None
 
-        solder_u8 = (corrected_solder_mask > 0).astype(np.uint8) * 255
-        solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        solder_u8 = valid_solder.astype(np.uint8) * 255
+        islands, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        for s_cnt in solder_cnts:
-            s_mask = np.zeros((H, W), dtype=np.uint8)
-            cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
+        for island in islands:
+            # Créer un masque de l'îlot (piste ou pad)
+            island_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.drawContours(island_mask, [island], -1, 255, -1)
             
-            inverted_s_mask = cv2.bitwise_not(solder_u8)
-            holes_in_island = cv2.bitwise_and(s_mask, inverted_s_mask)
-            h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Trouver les zones sombres (non-soudure) à l'intérieur de cet îlot
+            # On utilise l'image brute ou la pred_map pour trouver les manques
+            inner_holes = cv2.bitwise_and(island_mask, cv2.bitwise_not(solder_u8))
+            h_cnts, _ = cv2.findContours(inner_holes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             for h_cnt in h_cnts:
                 h_area = cv2.contourArea(h_cnt)
-                if h_area < 10: continue
+                if h_area < 15: continue # Filtrage mini
+
+                # Vérification exclusion via (hol_adj)
+                h_mask_check = np.zeros((H, W), dtype=np.uint8)
+                cv2.drawContours(h_mask_check, [h_cnt], -1, 255, -1)
+                if np.any((h_mask_check > 0) & (hol_adj > 0)): continue
                 
-                h_m = np.zeros((H, W), dtype=np.uint8)
-                cv2.drawContours(h_m, [h_cnt], -1, 255, -1)
-                if np.any((h_m > 0) & (hol_adj > 0)): continue
-                
-                final_voids_mask[h_m > 0] = 255
+                # C'est un void valide
+                final_voids_mask[h_mask_check > 0] = 255
                 if h_area > max_void_area:
                     max_void_area = h_area
                     max_void_poly = h_cnt
 
-        # --- CALCULS FINAUX ---
+        # --- 4. CALCULS ET OVERLAY ---
         area_total_px = np.sum(z_utile > 0)
+        # Le manque total est maintenant uniquement ce qui est en rouge
         missing_pct = (np.sum(final_voids_mask > 0) / area_total_px * 100.0) if area_total_px > 0 else 0
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # --- AFFICHAGE ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[corrected_solder_mask > 0] = [255, 255, 0] # Soudure + Pistes en Jaune
-        overlay[final_voids_mask > 0] = [255, 0, 0]        # Voids réels en Rouge
-        if max_void_poly is not None:
-            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
+        overlay[valid_solder] = [255, 255, 0] # Tout le métal (incluant pistes forcées)
+        overlay[final_voids_mask > 0] = [255, 0, 0] # Voids détectés en rouge
 
         st.divider()
         c_res, c_img = st.columns([1, 2])
