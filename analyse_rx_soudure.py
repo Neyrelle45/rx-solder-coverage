@@ -87,35 +87,42 @@ def compute_confidence(clf, features):
 def apply_clahe(img: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8)) -> np.ndarray:
     return cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size).apply(img)
 
+import math
+
 def compute_features(img: np.ndarray) -> np.ndarray:
-# --- PATCH ANTI-BRUIT & GÉOMÉTRIE ---
-    # Un flou médian plus fort (7 au lieu de 5) pour lisser le cuivre
-    img_clean = cv2.medianBlur(img, 7)
+    imgf = img.astype(np.float32)
     
-    imgf = img_clean.astype(np.float32)
+    # 1. Intensités de base
     f_int = imgf / 255.0
-    f_clahe = apply_clahe(img_clean) / 255.0
+    f_clahe = apply_clahe(img) / 255.0
     
-    # Gradients
-    gx = cv2.Sobel(img_clean, cv2.CV_32F, 1, 0, 3)
-    gy = cv2.Sobel(img_clean, cv2.CV_32F, 0, 1, 3)
+    # 2. Détection de structures rectilignes (Filtres de Scharr)
+    # Plus précis que Sobel pour les bords des pistes
+    gx = cv2.Scharr(img, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(img, cv2.CV_32F, 0, 1)
     mag = cv2.magnitude(gx, gy)
     
-    # Normalisations
-    gx = cv2.normalize(gx, None, 0, 1, cv2.NORM_MINMAX)
-    gy = cv2.normalize(gy, None, 0, 1, cv2.NORM_MINMAX)
-    mag = cv2.normalize(mag, None, 0, 1, cv2.NORM_MINMAX)
-    lap = cv2.normalize(cv2.Laplacian(img_clean, cv2.CV_32F, 3), None, 0, 1, cv2.NORM_MINMAX)
+    # 3. STATISTIQUES MULTI-ÉCHELLES (Le secret pour la géométrie)
+    # Fenêtre petite (3x3) pour les détails
+    mean3 = cv2.blur(imgf, (3, 3)) / 255.0
+    # Fenêtre large (15x15) : si c'est une piste, la moyenne reste stable
+    mean15 = cv2.blur(imgf, (15, 15)) / 255.0
     
-    # --- CARACTÉRISTIQUES DE FORME ---
-    # Moyenne et Variance sur une fenêtre plus large (7x7) pour capter la "masse" du void
-    mean7 = cv2.normalize(cv2.blur(imgf, (7, 7)), None, 0, 1, cv2.NORM_MINMAX)
-    var7  = cv2.normalize(np.clip(cv2.blur(imgf**2,(7,7)) - cv2.blur(imgf,(7,7))**2, 0, None), None, 0, 1, cv2.NORM_MINMAX)
+    # 4. DIFFÉRENCE DE GAUSSIENNES (DoG)
+    # Très efficace pour séparer les "trous" ronds des surfaces planes
+    dog = (cv2.GaussianBlur(imgf, (3,3), 0) - cv2.GaussianBlur(imgf, (11,11), 0))
+    dog = cv2.normalize(dog, None, 0, 1, cv2.NORM_MINMAX)
+
+    # 5. FILTRES DE GABOR RENFORCÉS (Orientations 0, 45, 90, 135)
+    # On augmente la taille (15,15) pour "sentir" la longueur des pistes
+    features_list = [f_int, f_clahe, mag/mag.max(), dog, mean3, mean15]
     
-    g0    = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((9,9),2.0,0.0,5.0,0.5,0)), None, 0, 1, cv2.NORM_MINMAX)
-    g45   = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((9,9),2.0,math.pi/4,5.0,0.5,0)), None, 0, 1, cv2.NORM_MINMAX)
-    
-    return np.stack([f_int, f_clahe, gx, gy, mag, lap, mean7, var7, g0, g45], axis=-1)
+    for angle in [0, math.pi/4, math.pi/2, 3*math.pi/4]:
+        kern = cv2.getGaborKernel((15, 15), 4.0, angle, 10.0, 0.5, 0, ktype=cv2.CV_32F)
+        f_gabor = cv2.filter2D(imgf, cv2.CV_32F, kern)
+        features_list.append(cv2.normalize(f_gabor, None, 0, 1, cv2.NORM_MINMAX))
+
+    return np.stack(features_list, axis=-1)
 
 # =========================
 # Labels (scribbles) — tolérant (.png/.jpg/.jpeg)
