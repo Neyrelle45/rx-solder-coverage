@@ -26,7 +26,7 @@ st.sidebar.title("🛠️ Configuration")
 if st.sidebar.button("🗑️ Vider l'historique", use_container_width=True):
     st.session_state.history = []; st.session_state.selected_img = None
 
-contrast_val = st.sidebar.slider("Contraste (CLAHE)", 0.0, 10.0, 2.0, 0.5)
+contrast_val = st.sidebar.slider("Contraste (CLAHE)", 0.0, 10.0, 2.0, 0.1)
 model_file = st.sidebar.file_uploader("Charger modèle (.joblib)", type=["joblib"])
 
 if model_file:
