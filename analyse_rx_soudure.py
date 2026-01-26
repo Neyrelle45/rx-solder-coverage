@@ -88,24 +88,34 @@ def apply_clahe(img: np.ndarray, clip_limit: float = 2.0, tile_grid_size=(8, 8))
     return cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size).apply(img)
 
 def compute_features(img: np.ndarray) -> np.ndarray:
-    img = cv2.medianBlur(img, 5)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
-    img = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
-    imgf = img.astype(np.float32)
+# --- PATCH ANTI-BRUIT & GÉOMÉTRIE ---
+    # Un flou médian plus fort (7 au lieu de 5) pour lisser le cuivre
+    img_clean = cv2.medianBlur(img, 7)
+    
+    imgf = img_clean.astype(np.float32)
     f_int = imgf / 255.0
-    f_clahe = apply_clahe(img) / 255.0
-    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, 3)
-    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, 3)
+    f_clahe = apply_clahe(img_clean) / 255.0
+    
+    # Gradients
+    gx = cv2.Sobel(img_clean, cv2.CV_32F, 1, 0, 3)
+    gy = cv2.Sobel(img_clean, cv2.CV_32F, 0, 1, 3)
     mag = cv2.magnitude(gx, gy)
+    
+    # Normalisations
     gx = cv2.normalize(gx, None, 0, 1, cv2.NORM_MINMAX)
     gy = cv2.normalize(gy, None, 0, 1, cv2.NORM_MINMAX)
     mag = cv2.normalize(mag, None, 0, 1, cv2.NORM_MINMAX)
-    lap = cv2.normalize(cv2.Laplacian(img, cv2.CV_32F, 3), None, 0, 1, cv2.NORM_MINMAX)
-    mean5 = cv2.normalize(cv2.blur(imgf, (5, 5)), None, 0, 1, cv2.NORM_MINMAX)
-    var5  = cv2.normalize(np.clip(cv2.blur(imgf**2,(5,5)) - cv2.blur(imgf,(5,5))**2, 0, None), None, 0, 1, cv2.NORM_MINMAX)
+    lap = cv2.normalize(cv2.Laplacian(img_clean, cv2.CV_32F, 3), None, 0, 1, cv2.NORM_MINMAX)
+    
+    # --- CARACTÉRISTIQUES DE FORME ---
+    # Moyenne et Variance sur une fenêtre plus large (7x7) pour capter la "masse" du void
+    mean7 = cv2.normalize(cv2.blur(imgf, (7, 7)), None, 0, 1, cv2.NORM_MINMAX)
+    var7  = cv2.normalize(np.clip(cv2.blur(imgf**2,(7,7)) - cv2.blur(imgf,(7,7))**2, 0, None), None, 0, 1, cv2.NORM_MINMAX)
+    
     g0    = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((9,9),2.0,0.0,5.0,0.5,0)), None, 0, 1, cv2.NORM_MINMAX)
     g45   = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((9,9),2.0,math.pi/4,5.0,0.5,0)), None, 0, 1, cv2.NORM_MINMAX)
-    return np.stack([f_int,f_clahe,gx,gy,mag,lap,mean5,var5,g0,g45], axis=-1)
+    
+    return np.stack([f_int, f_clahe, gx, gy, mag, lap, mean7, var7, g0, g45], axis=-1)
 
 # =========================
 # Labels (scribbles) — tolérant (.png/.jpg/.jpeg)
