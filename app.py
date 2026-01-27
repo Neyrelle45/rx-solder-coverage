@@ -1,15 +1,10 @@
 import streamlit as st
 import cv2
 import numpy as np
-import pandas as pd
 import joblib
-import datetime
 import analyse_rx_soudure as engine 
 
-st.set_page_config(page_title="RX Expert - Version Finale", layout="wide")
-
-if 'history' not in st.session_state:
-    st.session_state.history = []
+st.set_page_config(page_title="RX Expert - FIX COULEURS", layout="wide")
 
 st.sidebar.title("🛠️ Configuration")
 model_file = st.sidebar.file_uploader("1. Charger modèle (.joblib)", type=["joblib"])
@@ -28,7 +23,6 @@ if model_file:
 
     if rx_upload and mask_upload:
         # --- RÉGLAGES ALIGNEMENT ---
-        st.sidebar.divider()
         tx = st.sidebar.number_input("Trans X", value=0)
         ty = st.sidebar.number_input("Trans Y", value=0)
         rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
@@ -37,13 +31,13 @@ if model_file:
         # --- CHARGEMENT ---
         rx_upload.seek(0)
         img_raw = cv2.imdecode(np.frombuffer(rx_upload.read(), np.uint8), cv2.IMREAD_GRAYSCALE)
-        if img_raw is None: st.stop()
-
+        
+        # Application CLAHE
         clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8)) if contrast_val > 0 else None
         img_gray = clahe.apply(img_raw) if clahe else img_raw
         H, W = img_gray.shape
 
-        # --- MASQUE ---
+        # --- TRAITEMENT MASQUE ---
         mask_upload.seek(0)
         insp_raw = cv2.imdecode(np.frombuffer(mask_upload.read(), np.uint8), cv2.IMREAD_COLOR)
         r_r, g_r, b_r = cv2.split(cv2.cvtColor(insp_raw, cv2.COLOR_BGR2RGB))
@@ -55,53 +49,46 @@ if model_file:
         hol_adj = cv2.warpAffine(cv2.resize(m_black, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj > 0) & (hol_adj == 0)
 
-        # --- ANALYSE IA ---
+        # --- PRÉDICTION IA ---
         features = engine.compute_features(img_gray)
         pred_map = clf.predict(features.reshape(-1, features.shape[-1])).reshape(H, W)
 
-        # --- ATTRIBUTION DES COULEURS (INVERSION VERROUILLÉE) ---
-        # Basé sur ton retour visuel : 
-        # On force la Classe 1 en BLEU (Soudure)
-        # On force la Classe 0 en ROUGE (Manques)
+        # --- ATTRIBUTION RADICALE DES COULEURS ---
+        # Sur tes images, la zone de soudure (matière) est la Classe 1.
+        # Nous voulons : Soudure = BLEU, Manque = ROUGE.
         
-        mask_soudure = ((pred_map == 1) & (z_utile))
-        mask_manque = ((pred_map == 0) & (z_utile))
+        mask_solder = ((pred_map == 1) & (z_utile)) # Classe 1 forcée en bleu
+        mask_voids = ((pred_map == 0) & (z_utile))  # Classe 0 forcée en rouge
 
-        # --- RENDU ---
+        # --- RENDU FINAL ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         
-        # 1. On applique le BLEU FONCÉ sur la soudure
-        overlay[mask_soudure] = [0, 50, 160]
+        # Coloration SOUDURE (Bleu)
+        overlay[mask_solder] = [0, 50, 160] 
         
-        # 2. On applique le ROUGE sur les manques
-        overlay[mask_manque] = [255, 0, 0]
+        # Coloration MANQUE (Rouge)
+        overlay[mask_voids] = [255, 0, 0]
 
-        # 3. VOID MAJEUR (CYAN ÉPAIS)
+        # --- VOID MAJEUR (CYAN) ---
         v_max_area, v_max_poly = 0, None
-        kernel = np.ones((3,3), np.uint8)
-        clean_voids = cv2.morphologyEx(mask_manque.astype(np.uint8), cv2.MORPH_OPEN, kernel)
-        cnts, _ = cv2.findContours((clean_voids*255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+        cnts, _ = cv2.findContours(mask_voids.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in cnts:
             area = cv2.contourArea(c)
             if area > v_max_area:
                 v_max_area, v_max_poly = area, c
-        
         if v_max_poly is not None:
             cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3)
 
         # --- AFFICHAGE ---
         st.divider()
-        c1, c2 = st.columns(2)
-        with c1:
+        col1, col2 = st.columns(2)
+        with col1:
             st.subheader("🖼️ Image Originale (Réf)")
             st.image(img_gray, use_container_width=True)
             area_tot = np.sum(z_utile)
-            st.metric("Manque Total (Rouge)", f"{(np.sum(mask_manque)/area_tot*100):.2f} %")
-            st.metric("Void Majeur (Cyan)", f"{(v_max_area/area_tot*100):.3f} %")
-
-        with c2:
+            st.metric("Manque Total (Rouge)", f"{(np.sum(mask_voids)/area_tot*100):.2f} %" if area_tot > 0 else "0 %")
+            
+        with col2:
             st.subheader("🤖 Analyse IA")
             st.image(overlay, use_container_width=True)
-            if st.button("📥 Archiver", key="save_final"):
-                st.toast("Archivé")
+            st.button("📥 Archiver", key="save_final_fix")
