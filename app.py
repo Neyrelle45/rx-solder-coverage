@@ -3,11 +3,10 @@ import cv2
 import numpy as np
 import pandas as pd
 import joblib
-import io
 import datetime
 import analyse_rx_soudure as engine 
 
-st.set_page_config(page_title="RX Expert - Analyse Unitaire", layout="wide")
+st.set_page_config(page_title="RX Expert - Correction Finale", layout="wide")
 
 if 'history' not in st.session_state:
     st.session_state.history = []
@@ -21,7 +20,7 @@ if model_file:
     def load_my_model(file): return joblib.load(file)
     clf = load_my_model(model_file)
 
-    st.header("🔍 Analyse Comparative")
+    st.header("🔍 Analyse Comparative Rectifiée")
     
     c_u, c_m = st.columns(2)
     with c_u: rx_upload = st.file_uploader("1. Image RX", type=["png", "jpg", "jpeg", "tif"])
@@ -43,13 +42,9 @@ if model_file:
             st.error("Erreur de lecture.")
             st.stop()
 
-        # Application CLAHE locale
-        if contrast_val > 0:
-            clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8))
-            img_gray = clahe.apply(img_raw)
-        else:
-            img_gray = img_raw
-
+        # CLAHE local
+        clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8)) if contrast_val > 0 else None
+        img_gray = clahe.apply(img_raw) if clahe else img_raw
         H, W = img_gray.shape
 
         # --- MASQUE ---
@@ -64,22 +59,27 @@ if model_file:
         hol_adj = cv2.warpAffine(cv2.resize(m_black, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj > 0) & (hol_adj == 0)
 
-        # --- IA ET LOGIQUE DES CLASSES (INVERSÉE) ---
+        # --- IA : CALCUL DES PROBABILITÉS ---
         features = engine.compute_features(img_gray)
-        pred_map = np.argmax(clf.predict_proba(features.reshape(-1, features.shape[-1])), axis=1).reshape(H, W)
+        # On récupère les probabilités au lieu de la classe directe pour plus de finesse
+        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
         
-        # Ici, on inverse la logique pour correspondre à tes images :
-        # Si pred_map == 1 était la soudure (Rouge sur ton image précédente)
-        # On définit maintenant MANQUE = pred_map == 1 (Pour le mettre en ROUGE)
-        # Et SOUDURE = pred_map == 0 (Pour le mettre en BLEU)
+        # LOGIQUE : 
+        # Classe 0 = Manque (Zones claires) -> On veut du ROUGE
+        # Classe 1 = Soudure (Zones sombres) -> On veut du BLEU
+        pred_map = np.argmax(probs, axis=1).reshape(H, W)
         
-        void_raw = ((pred_map == 1) & (z_utile)).astype(np.uint8) 
+        # --- FILTRAGE ET NETTOYAGE ---
+        # On définit le manque comme étant la Classe 0 (JAUNE dans tes labels d'origine)
+        void_mask = ((pred_map == 0) & (z_utile)).astype(np.uint8)
+        
         kernel = np.ones((3,3), np.uint8)
-        clean_voids = cv2.morphologyEx(void_raw, cv2.MORPH_OPEN, kernel)
+        clean_voids = cv2.morphologyEx(void_mask, cv2.MORPH_OPEN, kernel)
         
+        # On définit la soudure comme tout le reste de la zone utile
         clean_solder = (z_utile) & (clean_voids == 0)
 
-        # --- CALCUL VOID MAJEUR ---
+        # --- VOID MAJEUR ---
         v_max_area, v_max_poly = 0, None
         z_stricte = cv2.erode(z_utile.astype(np.uint8), kernel, iterations=1)
         cnts, _ = cv2.findContours((clean_voids * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -93,16 +93,17 @@ if model_file:
                 if area > v_max_area:
                     v_max_area, v_max_poly = area, c
 
-        # --- RENDU VISUEL ---
+        # --- RENDU FINAL ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         
-        # SOUDURE PRÉSENTE -> BLEU FONCÉ
-        overlay[clean_solder] = [0, 50, 150]
+        # 1. On applique la SOUDURE en BLEU FONCÉ partout dans z_utile
+        # (On part du principe que la zone est pleine par défaut)
+        overlay[z_utile] = [0, 50, 150]
         
-        # MANQUES / VOIDS -> ROUGE
+        # 2. On "troue" le bleu avec le ROUGE là où l'IA voit des manques (Classe 0)
         overlay[clean_voids > 0] = [255, 0, 0]
         
-        # VOID MAX -> CONTOUR CYAN ÉPAIS
+        # 3. On entoure le void max en CYAN
         if v_max_poly is not None:
             cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3)
 
@@ -110,7 +111,7 @@ if model_file:
         st.divider()
         col_ref, col_ia = st.columns(2)
         with col_ref:
-            st.subheader("🖼️ Image Originale (Réf)")
+            st.subheader("🖼️ Image Originale")
             st.image(img_gray, use_container_width=True)
             area_tot = np.sum(z_utile)
             st.metric("Manque Total (Rouge)", f"{(np.sum(clean_voids)/area_tot*100):.2f} %" if area_tot > 0 else "0 %")
@@ -119,5 +120,5 @@ if model_file:
         with col_ia:
             st.subheader("🤖 Analyse IA")
             st.image(overlay, use_container_width=True)
-            if st.button("📥 Archiver", key="final_btn_v5", use_container_width=True):
-                st.toast("Résultat archivé")
+            if st.button("📥 Archiver", key="final_fix_btn", use_container_width=True):
+                st.toast("Archivé")
