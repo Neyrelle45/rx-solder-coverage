@@ -61,27 +61,30 @@ if model_file:
         z_utile = (env_adj & ~hol_adj)
 
         # Analyse IA
-        # --- 1. PRÉDICTION ET NETTOYAGE DU BRUIT ---
+# --- 1. PRÉDICTION IA ET NETTOYAGE ---
         features = engine.compute_features(img_gray)
         probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
         pred_map = np.argmax(probs, axis=1).reshape(H, W)
         
-        # Filtrage morphologique pour supprimer le "sel et poivre" (bruit)
+        # Calcul de la confiance (on le définit bien ici pour éviter l'erreur)
+        conf_map = np.max(probs, axis=1).reshape(H, W)
+        mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
+
+        # Suppression du bruit (Opening) pour éviter les points rouges isolés
         kernel = np.ones((3,3), np.uint8)
-        # On nettoie la classe 0 (voids) et la classe 1 (soudure)
         clean_voids = cv2.morphologyEx(((pred_map == 0) & (z_utile > 0)).astype(np.uint8), cv2.MORPH_OPEN, kernel)
         clean_solder = cv2.morphologyEx(((pred_map == 1) & (z_utile > 0)).astype(np.uint8), cv2.MORPH_OPEN, kernel)
 
-        # --- 2. CALCULS DE SURFACES COHÉRENTS ---
+        # --- 2. CALCULS DE SURFACES ---
         area_total_px = np.sum(z_utile > 0)
-        # Le manque total est la somme de TOUS les pixels rouges nettoyés
+        # Le manque total est la somme des pixels rouges nettoyés
         missing_pct = (np.sum(clean_voids) / area_total_px * 100.0) if area_total_px > 0 else 0
 
-        # --- 3. LOGIQUE : VOID MAJEUR ENCLAVÉ ---
+        # --- 3. LOGIQUE DU VOID MAJEUR ENCLAVÉ ---
         max_void_area = 0
         max_void_poly = None
-        
-        # On définit les îlots de soudure pour chercher les trous dedans
+
+        # On cherche les îlots de soudure (jaunes)
         solder_u8 = (clean_solder > 0).astype(np.uint8) * 255
         solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -89,21 +92,21 @@ if model_file:
             s_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
             
-            # Trous = (Zone dans l'îlot) ET (Zone classée Void par l'IA)
+            # Trous = Zones classées rouges par l'IA situées DANS l'îlot jaune
             holes_in_island = cv2.bitwise_and(s_mask, (clean_voids * 255).astype(np.uint8))
             h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             for h_cnt in h_cnts:
                 area = cv2.contourArea(h_cnt)
-                if area < 15.0: continue # Filtre mini pour le macro-void
+                if area < 10.0: continue
                 
+                # Masque spécifique à ce trou pour tester l'exclusion
                 h_mask = np.zeros((H, W), dtype=np.uint8)
                 cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
                 
-                # CRITÈRE D'EXCLUSION STRICT : Si le void touche un Via (zone noire du masque)
-                # On utilise un overlap (si plus de 1 pixel touche, on exclut)
-                overlap = cv2.bitwise_and(h_mask, (hol_adj * 255).astype(np.uint8))
-                if np.any(overlap > 0):
+                # CRITÈRE D'EXCLUSION : Ne doit pas toucher une zone noire (via)
+                # On vérifie l'intersection avec hol_adj
+                if np.any((h_mask > 0) & (hol_adj > 0)):
                     continue
                 
                 if area > max_void_area:
@@ -114,11 +117,11 @@ if model_file:
 
         # --- 4. OVERLAY ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[clean_solder > 0] = [255, 255, 0] # Jaune
-        overlay[clean_voids > 0] = [255, 0, 0]   # Rouge
+        overlay[clean_solder > 0] = [255, 255, 0] # Soudure en Jaune
+        overlay[clean_voids > 0] = [255, 0, 0]   # Manques en Rouge
         if max_void_poly is not None:
-            # On dessine le contour du plus gros en Cyan pour le mettre en évidence
-            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
+            # On entoure le plus gros d'un liseré Cyan
+            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 2)
 
         # Affichage et Archivage
         st.divider()
