@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pandas as pd
 import joblib
-from datetime import datetime
+import argparse
 from glob import glob
 
 # Optimisation OpenCV
@@ -14,10 +14,9 @@ except:
     pass
 
 # =========================
-# UTILS DE BASE
+# UTILS
 # =========================
 def load_gray(p, contrast_limit=2.0):
-    """Charge une image en gris avec un CLAHE optionnel."""
     img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
     if img is None: return None
     if contrast_limit > 0:
@@ -26,12 +25,10 @@ def load_gray(p, contrast_limit=2.0):
     return img
 
 def apply_clahe(img):
-    """Applique un CLAHE standard (utilisé dans compute_features)."""
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     return clahe.apply(img)
 
 def compose_similarity(scale, rotation_deg, tx, ty, cx, cy):
-    """Génère la matrice de transformation pour l'alignement manuel."""
     angle = math.radians(rotation_deg)
     a = scale * math.cos(angle)
     b = scale * math.sin(angle)
@@ -41,95 +38,106 @@ def compose_similarity(scale, rotation_deg, tx, ty, cx, cy):
     ], dtype=np.float32)
     return M
 
-# =========================
-# CŒUR IA (PRÉSERVÉ)
-# =========================
+# ==========================================
+# CŒUR DU MOTEUR IA
+# ==========================================
 def compute_features(img: np.ndarray) -> np.ndarray:
-    """Extractions des caractéristiques pour le Random Forest."""
     imgf = img.astype(np.float32)
     f_int = imgf / 255.0
     f_clahe = apply_clahe(img).astype(np.float32) / 255.0
 
-    # Gradients Scharr (Précision bords)
     gx = cv2.Scharr(img, cv2.CV_32F, 1, 0)
     gy = cv2.Scharr(img, cv2.CV_32F, 0, 1)
     mag = cv2.normalize(cv2.magnitude(gx, gy), None, 0, 1, cv2.NORM_MINMAX)
 
-    # Directionnalité (Anisotropie pour différencier bords/voids)
     edge_dir = np.abs(gx) / (np.abs(gy) + 5.0)
     edge_dir = cv2.normalize(np.clip(edge_dir, 0, 10), None, 0, 1, cv2.NORM_MINMAX)
 
-    # Statistiques locales
     mean3 = cv2.blur(imgf, (3, 3)) / 255.0
     mean21 = cv2.blur(imgf, (21, 21)) / 255.0
     
-    # Filtre de continuité verticale (Bandes latérales)
     v_kernel = np.ones((25, 1), np.float32) / 25.0
     v_line = cv2.filter2D(f_int, -1, v_kernel)
 
-    # Différence de Gaussiennes (DoG)
-    dog = cv2.normalize(cv2.GaussianBlur(imgf,(3,3),0)-cv2.GaussianBlur(imgf,(15,15),0), None, 0, 1, cv2.NORM_MINMAX)
+    dog = cv2.normalize(cv2.GaussianBlur(imgf,(3,3),0) - cv2.GaussianBlur(imgf,(15,15),0), None, 0, 1, cv2.NORM_MINMAX)
 
-    # Gabor
     g_v = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((15,15), 4.0, math.pi/2, 10.0, 0.5, 0)), None, 0, 1, cv2.NORM_MINMAX)
     g_h = cv2.normalize(cv2.filter2D(imgf, cv2.CV_32F, cv2.getGaborKernel((15,15), 4.0, 0, 10.0, 0.5, 0)), None, 0, 1, cv2.NORM_MINMAX)
 
     return np.stack([f_int, f_clahe, mag, edge_dir, dog, v_line, mean3, mean21, g_v, g_h], axis=-1)
 
 # =========================
-# ENTRAÎNEMENT
+# ENTRAÎNEMENT OPTIMISÉ
 # =========================
 def train_model(img_dir, lbl_dir, out_dir, n_estimators=150, max_samples=5000):
     from sklearn.ensemble import RandomForestClassifier
     
-    img_paths = sorted(glob(os.path.join(img_dir, "*.*")))
+    # Liste toutes les images RX
+    img_paths = sorted([p for p in glob(os.path.join(img_dir, "*.*")) if p.lower().endswith(('.png', '.jpg', '.jpeg', '.tif'))])
     X_list, y_list = [], []
 
-    for p in img_paths:
-        name = os.path.basename(p)
-        lp = os.path.join(lbl_dir, name)
-        if not os.path.exists(lp): continue
+    print(f"--- Analyse des dossiers ---")
+    print(f"Images RX trouvées : {len(img_paths)}")
 
-        img = load_gray(p)
+    for p in img_paths:
+        img_name = os.path.basename(p)
+        base_name = os.path.splitext(img_name)[0]
+        
+        # LOGIQUE FLEXIBLE : cherche base_name + "_label" + n'importe quelle extension
+        label_pattern = os.path.join(lbl_dir, f"{base_name}_label.*")
+        found_labels = glob(label_pattern)
+
+        if not found_labels:
+            print(f"⚠️ Ignoré : Pas de label trouvé pour {img_name} (Pattern: {base_name}_label.*)")
+            continue
+
+        lp = found_labels[0]
+        img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
         lbl = cv2.imread(lp, cv2.IMREAD_GRAYSCALE)
-        if img is None or lbl is None: continue
+        
+        if img is None or lbl is None: 
+            print(f"❌ Erreur lecture : {img_name}")
+            continue
+
+        print(f"✅ Association : {img_name} <--> {os.path.basename(lp)}")
 
         feat = compute_features(img)
-        h, w, c = feat.shape
-        feat_flat = feat.reshape(-1, c)
+        feat_flat = feat.reshape(-1, feat.shape[-1])
         lbl_flat = (lbl.flatten() > 127).astype(np.uint8)
 
-        # Sous-échantillonnage pour éviter l'explosion mémoire
+        # Sous-échantillonnage
         indices = np.random.choice(len(lbl_flat), min(len(lbl_flat), max_samples), replace=False)
         X_list.append(feat_flat[indices])
         y_list.append(lbl_flat[indices])
 
-    if not X_list: return
+    if not X_list:
+        print("❌ AUCUNE DONNÉE. Vérifiez que vos labels finissent bien par '_label' (ex: image1_label.png)")
+        return
     
     X, y = np.vstack(X_list), np.concatenate(y_list)
-    clf = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, class_weight="balanced", max_depth=None)
+    print(f"🚀 Entraînement sur {X.shape[0]} points...")
+    
+    clf = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, class_weight="balanced", max_depth=None, random_state=42)
     clf.fit(X, y)
     
     os.makedirs(out_dir, exist_ok=True)
-    joblib.dump(clf, os.path.join(out_dir, "model_rx.joblib"))
-    print(f"Modèle sauvegardé dans {out_dir}")
+    save_path = os.path.join(out_dir, "model_rx.joblib")
+    joblib.dump(clf, save_path)
+    print(f"💾 MODÈLE SAUVEGARDÉ : {save_path}")
 
 # =========================
-# INTERFACE CLI MINIMALE
+# CLI
 # =========================
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="cmd")
-    
     train_p = subparsers.add_parser("train")
     train_p.add_argument("--images-dir", required=True)
     train_p.add_argument("--labels-dir", required=True)
-    train_p.add_argument("--models-dir", default="./models")
+    train_p.add_argument("--models-dir", required=True)
     train_p.add_argument("--n-estimators", type=int, default=150)
     train_p.add_argument("--max-samples-per-image", type=int, default=5000)
 
     args = parser.parse_args()
     if args.cmd == "train":
-        train_model(args.images_dir, args.labels_dir, args.models_dir, 
-                    args.n_estimators, args.max_samples_per_image)
+        train_model(args.images_dir, args.labels_dir, args.models_dir, args.n_estimators, args.max_samples_per_image)
