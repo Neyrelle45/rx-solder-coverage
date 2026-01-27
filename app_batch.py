@@ -9,17 +9,16 @@ import analyse_rx_soudure as engine
 
 st.set_page_config(page_title="RX Expert - Version Cumulée", layout="wide")
 
-# Initialisation de l'historique si inexistant
+# Initialisation de l'historique
 if 'batch_history' not in st.session_state:
     st.session_state.batch_history = []
 
 def apply_table_style(df):
-    """Style du tableau : Bleu pour le min, Rouge pour le max sur Total_%."""
     return df.style.highlight_max(subset=['Total_%'], color='#ffcccc', axis=0) \
                    .highlight_min(subset=['Total_%'], color='#cce5ff', axis=0)
 
 # --- INTERFACE ---
-st.title("📦 Analyse de Série (Incrémentation des Résultats)")
+st.title("📦 Analyse de Série (Optimisée)")
 
 st.sidebar.title("⚙️ Contrôles")
 model_file = st.sidebar.file_uploader("1. Modèle IA", type=["joblib"])
@@ -31,8 +30,6 @@ ty = st.sidebar.number_input("Translation Y", value=0)
 rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
 sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
-st.sidebar.divider()
-# Ce bouton reste le seul moyen de vider le tableau
 if st.sidebar.button("🗑️ Vider tout l'historique", use_container_width=True):
     st.session_state.batch_history = []
     st.rerun()
@@ -44,12 +41,10 @@ with col_m:
     mask_file = st.file_uploader("Masque de référence", type=["png", "jpg"])
 
 st.divider()
-trigger = st.button("🚀 Lancer l'analyse (Ajouter à la suite)", use_container_width=True, type="primary")
+trigger = st.button("🚀 Lancer l'analyse", use_container_width=True, type="primary")
 
 if trigger and model_file and uploaded_rx and mask_file:
     clf = joblib.load(model_file)
-    
-    # --- MODIFICATION ICI : On ne vide plus st.session_state.batch_history ---
     
     # 1. PRÉPARATION DES MASQUES MAITRES
     m_raw = cv2.imdecode(np.frombuffer(mask_file.read(), np.uint8), cv2.IMREAD_COLOR)
@@ -69,11 +64,11 @@ if trigger and model_file and uploaded_rx and mask_file:
         env_adj = cv2.warpAffine(cv2.resize(m_green_master, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         hol_adj = cv2.warpAffine(cv2.resize(m_black_master, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         
-        # Zone inspectée = Vert MOINS Noir
+        # Zone utile (Soudure théorique)
         z_inspectee = ((env_adj > 0) & (hol_adj == 0)).astype(np.uint8)
-        area_ref = np.sum(z_inspectee)
+        area_ref = np.sum(z_inspectee > 0)
 
-# 3. IA & NETTOYAGE DU BRUIT
+        # 3. IA & NETTOYAGE DU BRUIT
         feats = engine.compute_features(img_gray)
         raw_pred = np.argmax(clf.predict_proba(feats.reshape(-1, feats.shape[-1])), axis=1).reshape(H, W)
         
@@ -121,15 +116,8 @@ if trigger and model_file and uploaded_rx and mask_file:
         
         if v_max_poly is not None:
             cv2.drawContours(res_rgb, [v_max_poly], -1, [0, 255, 255], 2)
-        
-        # RÉTABLISSEMENT DES VIAS (TRANSPARENCE)
-        res_rgb[hol_adj > 0] = img_rx_col[hol_adj > 0]
-        
-        # CONTOUR CYAN (Void Max Interne)
-        if v_max_poly is not None:
-            cv2.drawContours(res_rgb, [v_max_poly], -1, [0, 255, 255], 2)
 
-        # 6. CALCULS & AJOUT À L'HISTORIQUE (CUMULÉ)
+        # 6. CALCULS & HISTORIQUE
         total_pct = (np.sum(mask_red) / area_ref * 100) if area_ref > 0 else 0
         void_max_pct = (v_max_area / area_ref * 100) if area_ref > 0 else 0
 
@@ -146,21 +134,16 @@ if trigger and model_file and uploaded_rx and mask_file:
 if st.session_state.batch_history:
     df = pd.DataFrame(st.session_state.batch_history)
     st.subheader(f"📊 Résultats (Total : {len(df)} images)")
-    
-    # Affichage du tableau avec code couleur
     st.dataframe(apply_table_style(df.drop(columns=['img_bytes'])), use_container_width=True)
     
-    # Bouton d'archivage ZIP de tout l'historique
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as z:
         z.writestr("rapport_complet.csv", df.drop(columns=['img_bytes']).to_csv(index=False))
         for i, item in enumerate(st.session_state.batch_history):
-            # Ajout d'un index pour éviter les doublons de noms de fichiers
             z.writestr(f"images/{i}_{item['Fichier']}.jpg", item['img_bytes'])
     
     st.download_button("📥 Télécharger TOUTE l'archive ZIP", zip_buf.getvalue(), "analyse_globale.zip", use_container_width=True)
 
-    # Galerie des vignettes
     st.subheader("👁️ Galerie cumulée")
     grid = st.columns(4)
     for i, item in enumerate(st.session_state.batch_history):
