@@ -73,39 +73,54 @@ if trigger and model_file and uploaded_rx and mask_file:
         z_inspectee = ((env_adj > 0) & (hol_adj == 0)).astype(np.uint8)
         area_ref = np.sum(z_inspectee)
 
-        # 3. IA & SEGMENTATION ROUGE
+# 3. IA & NETTOYAGE DU BRUIT
         feats = engine.compute_features(img_gray)
         raw_pred = np.argmax(clf.predict_proba(feats.reshape(-1, feats.shape[-1])), axis=1).reshape(H, W)
         
-        mask_red = ((raw_pred == 0) & (z_inspectee > 0)).astype(np.uint8)
+        # On ne garde que la classe 0 (void) dans la zone utile
+        void_raw = ((raw_pred == 0) & (z_inspectee > 0)).astype(np.uint8)
         
-        # 4. LOGIQUE VOID MAX (AUCUN CONTACT VIA/BORD)
-        kernel = np.ones((3,3), np.uint8)
-        z_autorisee_interne = cv2.erode(z_inspectee, kernel, iterations=1)
+        # Morphologie : Ouverture pour supprimer les petits points isolés
+        kernel_clean = np.ones((3,3), np.uint8)
+        mask_red = cv2.morphologyEx(void_raw, cv2.MORPH_OPEN, kernel_clean)
         
-        v_max_area, v_max_poly = 0, None
-        cnts, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for c in cnts:
-            c_area = cv2.contourArea(c)
-            if c_area < (area_ref * 0.001): continue 
-            
-            c_mask = np.zeros((H, W), dtype=np.uint8)
-            cv2.drawContours(c_mask, [c], -1, 255, -1)
-            
-            if not np.any((c_mask > 0) & (z_autorisee_interne == 0)):
-                if c_area > v_max_area:
-                    v_max_area = c_area
-                    v_max_poly = c
+        # LOGIQUE BINAIRE : La soudure (jaune) est tout ce qui n'est pas rouge dans z_inspectee
+        mask_yellow = (z_inspectee > 0) & (mask_red == 0)
 
-        # 5. RENDU VISUEL
-        img_rx_col = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        res_rgb = img_rx_col.copy()
+        # 4. LOGIQUE VOID MAX (HIÉRARCHIE)
+        v_max_area, v_max_poly = 0, None
         
-        overlay = res_rgb.copy()
-        overlay[env_adj > 0] = [255, 255, 0] 
-        overlay[mask_red > 0] = [255, 0, 0]   
-        res_rgb = np.where(env_adj[:,:,None] > 0, overlay, res_rgb)
+        # On cherche les trous internes au jaune pour le macro-void
+        solder_u8 = mask_yellow.astype(np.uint8) * 255
+        # RETR_CCOMP permet d'isoler les trous (hiérarchie)
+        cnts, hiers = cv2.findContours(solder_u8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if hiers is not None:
+            for i, c in enumerate(cnts):
+                # Si le contour a un parent, c'est un trou (enclavé)
+                if hiers[0][i][3] != -1:
+                    c_area = cv2.contourArea(c)
+                    if c_area < 10: continue 
+                    
+                    # Test d'exclusion des zones noires (vias)
+                    c_mask = np.zeros((H, W), dtype=np.uint8)
+                    cv2.drawContours(c_mask, [c], -1, 255, -1)
+                    
+                    if not np.any((c_mask > 0) & (hol_adj > 0)):
+                        if c_area > v_max_area:
+                            v_max_area = c_area
+                            v_max_poly = c
+
+        # 5. RENDU VISUEL (Propre)
+        res_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
+        res_rgb[mask_yellow] = [255, 255, 0] # Jaune plein
+        res_rgb[mask_red > 0] = [255, 0, 0]   # Rouge
+        
+        # Overlay des VIAS par-dessus pour la clarté
+        res_rgb[hol_adj > 0] = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)[hol_adj > 0]
+        
+        if v_max_poly is not None:
+            cv2.drawContours(res_rgb, [v_max_poly], -1, [0, 255, 255], 2)
         
         # RÉTABLISSEMENT DES VIAS (TRANSPARENCE)
         res_rgb[hol_adj > 0] = img_rx_col[hol_adj > 0]
