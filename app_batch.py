@@ -82,29 +82,37 @@ if trigger and model_file and uploaded_rx and mask_file:
         # LOGIQUE BINAIRE : La soudure (jaune) est tout ce qui n'est pas rouge dans z_inspectee
         mask_yellow = (z_inspectee > 0) & (mask_red == 0)
 
-        # 4. LOGIQUE VOID MAX (HIÉRARCHIE)
+# --- 4. LOGIQUE VOID MAX (OPTIMISÉE ANTI-VIAS) ---
         v_max_area, v_max_poly = 0, None
         
-        # On cherche les trous internes au jaune pour le macro-void
-        solder_u8 = mask_yellow.astype(np.uint8) * 255
-        # RETR_CCOMP permet d'isoler les trous (hiérarchie)
-        cnts, hiers = cv2.findContours(solder_u8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        # On cherche tous les contours ROUGES (Manques détectés par l'IA)
+        # On ne passe plus par les trous du jaune pour éviter de capturer les vias
+        red_u8 = mask_red.astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(red_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        if hiers is not None:
-            for i, c in enumerate(cnts):
-                # Si le contour a un parent, c'est un trou (enclavé)
-                if hiers[0][i][3] != -1:
-                    c_area = cv2.contourArea(c)
-                    if c_area < 10: continue 
-                    
-                    # Test d'exclusion des zones noires (vias)
-                    c_mask = np.zeros((H, W), dtype=np.uint8)
-                    cv2.drawContours(c_mask, [c], -1, 255, -1)
-                    
-                    if not np.any((c_mask > 0) & (hol_adj > 0)):
-                        if c_area > v_max_area:
-                            v_max_area = c_area
-                            v_max_poly = c
+        for c in cnts:
+            c_area = cv2.contourArea(c)
+            if c_area < 10: continue 
+            
+            # Création d'un masque pour ce void précis
+            c_mask = np.zeros((H, W), dtype=np.uint8)
+            cv2.drawContours(c_mask, [c], -1, 255, -1)
+            
+            # --- CONDITION D'EXCLUSION CRUCIALE ---
+            # Un void est valide s'il est ENTIÈREMENT dans la zone d'inspection
+            # S'il touche un via (hol_adj) ou l'extérieur (env_adj == 0), on l'exclut du "Void Max"
+            
+            # 1. Touche-t-il un via ?
+            touches_via = np.any((c_mask > 0) & (hol_adj > 0))
+            
+            # 2. Est-il sur le bord du pad ? (Optionnel mais conseillé pour le "Void Majeur Enclavé")
+            # On vérifie s'il sort de la zone verte
+            touche_bord = np.any((c_mask > 0) & (env_adj == 0))
+            
+            if not touches_via and not touche_bord:
+                if c_area > v_max_area:
+                    v_max_area = c_area
+                    v_max_poly = c
 
         # 5. RENDU VISUEL (Propre)
         res_rgb = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
@@ -118,7 +126,9 @@ if trigger and model_file and uploaded_rx and mask_file:
             cv2.drawContours(res_rgb, [v_max_poly], -1, [0, 255, 255], 2)
 
         # 6. CALCULS & HISTORIQUE
+# Le total reste la somme de tous les rouges (même ceux touchant les vias)
         total_pct = (np.sum(mask_red) / area_ref * 100) if area_ref > 0 else 0
+        # Le void max est uniquement un void "propre" et interne
         void_max_pct = (v_max_area / area_ref * 100) if area_ref > 0 else 0
 
         _, enc = cv2.imencode(".jpg", cv2.cvtColor(res_rgb, cv2.COLOR_RGB2BGR))
