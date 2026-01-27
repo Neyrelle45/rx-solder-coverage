@@ -91,13 +91,19 @@ if model_file:
                 if area > v_max_area:
                     v_max_area, v_max_poly = area, c
 
-        # --- RENDU ---
+# --- RENDU FINAL (COULEURS CORRIGÉES) ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[clean_solder] = [0, 50, 150]    # BLEU FONCÉ (Soudure)
-        overlay[clean_voids > 0] = [255, 0, 0]  # ROUGE (Manques/Voids)
         
+        # 1. On applique d'abord le ROUGE sur tous les manques détectés
+        overlay[clean_voids > 0] = [255, 0, 0]  # ROUGE = MANQUES
+        
+        # 2. On applique ensuite le BLEU FONCÉ sur la soudure présente
+        # Cela garantit que la matière prédomine visuellement dans la zone utile
+        overlay[clean_solder] = [0, 50, 150]    # BLEU FONCÉ = SOUDURE
+        
+        # 3. On entoure le plus gros void en CYAN épais
         if v_max_poly is not None:
-            cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3) # CYAN ÉPAIS
+            cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3) # CYAN
 
         # --- AFFICHAGE ---
         st.divider()
