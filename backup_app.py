@@ -6,7 +6,6 @@ import joblib
 import io
 import zipfile
 import datetime
-import gc
 import analyse_rx_soudure as engine 
 
 st.set_page_config(page_title="RX Expert - Void Majeur Enclavé", layout="wide")
@@ -22,6 +21,7 @@ def highlight_extremes(s):
     is_max = s == s.max(); is_min = s == s.min()
     return ['background-color: #ffcccc' if v else 'background-color: #ccf2ff' if m else '' for v, m in zip(is_max, is_min)]
 
+# --- SIDEBAR RESTAURÉE ---
 st.sidebar.title("🛠️ Configuration")
 if st.sidebar.button("🗑️ Vider l'historique", use_container_width=True):
     st.session_state.history = []; st.session_state.selected_img = None
@@ -40,14 +40,17 @@ if model_file:
     with c_m: mask_upload = st.file_uploader("2. Masque (Vert/Noir)", type=["png", "jpg"])
 
     if rx_upload and mask_upload:
+        # Contrôles d'alignement d'origine
         tx = st.sidebar.number_input("Trans X", value=0); ty = st.sidebar.number_input("Trans Y", value=0)
         rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0); sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
+        # Chargement image
         img_gray = engine.load_gray(rx_upload, contrast_limit=contrast_val)
         H, W = img_gray.shape
 
-        # Traitement Masque
-        insp_raw = cv2.imdecode(np.frombuffer(mask_upload.read(), np.uint8), 1)
+        # Traitement Masque (Logique Vert/Noir)
+        mask_bytes = mask_upload.read()
+        insp_raw = cv2.imdecode(np.frombuffer(mask_bytes, np.uint8), cv2.IMREAD_COLOR)
         b_r, g_r, r_r = cv2.split(insp_raw)
         m_green_orig = (g_r > 100).astype(np.uint8)
         m_black_orig = ((b_r < 50) & (g_r < 50) & (r_r < 50) & (m_green_orig > 0)).astype(np.uint8)
@@ -67,57 +70,48 @@ if model_file:
         conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-        # Identification Zones
+        # --- CORRECTION COULEURS IA ---
+        # Soudure (Masse) = Jaune [255, 255, 0]
+        # Manques (Vides) = Rouge [255, 0, 0]
         valid_solder = (pred_map == 1) & (z_utile > 0)
         valid_voids = (pred_map == 0) & (z_utile > 0)
+        
         area_total_px = np.sum(z_utile > 0)
-        missing_pct = (1.0 - (np.sum(valid_solder) / area_total_px)) * 100.0 if area_total_px > 0 else 0
+        missing_pct = (np.sum(valid_voids) / area_total_px * 100.0) if area_total_px > 0 else 0
 
-        # --- LOGIQUE : VOID MAJEUR ENCLAVÉ DANS LE JAUNE ---
+        # --- LOGIQUE VOID MAJEUR ENCLAVÉ ---
         max_void_area = 0
         max_void_poly = None
-
-        # 1. On trouve les contours des zones de soudure (jaunes)
         solder_u8 = valid_solder.astype(np.uint8) * 255
         solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for s_cnt in solder_cnts:
-            # Pour chaque îlot de soudure, on crée un masque
             s_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
-            
-            # 2. On cherche les "trous" à l'intérieur de cet îlot
-            # Un trou est une zone qui n'est pas de la soudure MAIS qui est dans le périmètre de l'îlot
             inverted_s_mask = cv2.bitwise_not(solder_u8)
             holes_in_island = cv2.bitwise_and(s_mask, inverted_s_mask)
-            
             h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             for h_cnt in h_cnts:
                 area = cv2.contourArea(h_cnt)
                 if area < 10.0: continue
-                
                 h_mask = np.zeros((H, W), dtype=np.uint8)
                 cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
-                
-                # CRITÈRE D'EXCLUSION : Ne doit pas contenir de zone noire (via/non inspecté)
-                if np.any((h_mask > 0) & (hol_adj > 0)):
-                    continue
-                
-                if area > max_void_area:
-                    max_void_area = area
-                    max_void_poly = h_cnt
+                if not np.any((h_mask > 0) & (hol_adj > 0)):
+                    if area > max_void_area:
+                        max_void_area = area
+                        max_void_poly = h_cnt
 
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # Overlay
+        # --- RENDU ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[valid_solder] = [255, 255, 0]
-        overlay[valid_voids] = [255, 0, 0]
+        overlay[valid_solder] = [255, 255, 0] # Jaune pour la soudure
+        overlay[valid_voids] = [255, 0, 0]   # Rouge pour les manques
         if max_void_poly is not None:
-            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3)
+            cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 3) # Cyan pour le Void Max
 
-        # Affichage et Archivage
+        # Affichage
         st.divider()
         c_res, c_img = st.columns([1, 2])
         with c_res:
@@ -133,7 +127,7 @@ if model_file:
                 }); st.toast("Archivé")
         with c_img: st.image(overlay, use_container_width=True)
 
-# --- RAPPORT, ZIP ET GALERIE (FONCTIONS RESTAURÉES) ---
+# --- HISTORIQUE ET GALERIE (RESTAURÉS) ---
 if st.session_state.history:
     st.divider()
     df_full = pd.DataFrame(st.session_state.history)
