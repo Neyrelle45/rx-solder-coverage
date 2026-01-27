@@ -21,29 +21,31 @@ if model_file:
     def load_my_model(file): return joblib.load(file)
     clf = load_my_model(model_file)
 
-    st.header("🔍 Analyse du Void Majeur (Soudure Uniquement)")
+    st.header("🔍 Analyse Comparative et Ajustement")
+    
     c_u, c_m = st.columns(2)
     with c_u: rx_upload = st.file_uploader("1. Image RX", type=["png", "jpg", "jpeg", "tif"])
-    with c_m: mask_upload = st.file_uploader("2. Masque (Vert/Noir)", type=["png", "jpg"])
+    with c_m: mask_upload = st.file_uploader("2. Masque de référence", type=["png", "jpg"])
 
     if rx_upload and mask_upload:
-        # Contrôles d'alignement
+        # --- RÉGLAGES ALIGNEMENT SIDEBAR ---
         st.sidebar.divider()
+        st.sidebar.subheader("Positionnement Masque")
         tx = st.sidebar.number_input("Trans X", value=0)
         ty = st.sidebar.number_input("Trans Y", value=0)
         rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
         sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
-# --- CHARGEMENT SÉCURISÉ DE L'IMAGE ---
-        # On lit le fichier uploadé en bytes pour OpenCV
+        # --- CHARGEMENT SÉCURISÉ ---
+        rx_upload.seek(0)
         file_bytes = np.frombuffer(rx_upload.read(), np.uint8)
         img_raw = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
-
+        
         if img_raw is None:
-            st.error("Impossible de lire l'image RX. Vérifiez le format du fichier.")
+            st.error("Erreur de lecture de l'image.")
             st.stop()
 
-        # Application du contraste (CLAHE) via le moteur
+        # Application du contraste pour l'analyse
         if contrast_val > 0:
             clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8))
             img_gray = clahe.apply(img_raw)
@@ -52,7 +54,8 @@ if model_file:
 
         H, W = img_gray.shape
 
-        # Traitement Masque
+        # --- TRAITEMENT MASQUE ---
+        mask_upload.seek(0)
         insp_raw = cv2.imdecode(np.frombuffer(mask_upload.read(), np.uint8), 1)
         insp_rgb = cv2.cvtColor(insp_raw, cv2.COLOR_BGR2RGB)
         r_r, g_r, b_r = cv2.split(insp_rgb)
@@ -71,34 +74,27 @@ if model_file:
         probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
         pred_map = np.argmax(probs, axis=1).reshape(H, W)
         
-        # Confiance
-        conf_map = np.max(probs, axis=1).reshape(H, W)
-        mean_conf = np.mean(conf_map[z_utile]) * 100 if np.any(z_utile) else 0
-
-        # Nettoyage Bruit (Opening 3x3)
+        # Nettoyage Bruit
         kernel = np.ones((3,3), np.uint8)
         void_raw = ((pred_map == 0) & (z_utile)).astype(np.uint8)
         clean_voids = cv2.morphologyEx(void_raw, cv2.MORPH_OPEN, kernel)
         
-        # Logique Binaire : Tout ce qui est utile et non rouge est jaune
+        # Logique Couleur : Soudure en Bleu Foncé
+        # Bleu foncé en RGB : [0, 0, 139]
         clean_solder = (z_utile) & (clean_voids == 0)
 
         # --- CALCUL VOID MAJEUR ENCLAVÉ ---
         v_max_area, v_max_poly = 0, None
         red_u8 = (clean_voids * 255).astype(np.uint8)
         cnts, _ = cv2.findContours(red_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Zone de bordure pour exclusion (Erosion de 3px)
         z_interne_stricte = cv2.erode(z_utile.astype(np.uint8), kernel, iterations=1)
 
         for c in cnts:
             area = cv2.contourArea(c)
             if area < 10: continue
-            
             c_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(c_mask, [c], -1, 255, -1)
             
-            # Exclusion si touche Via (Noir) ou Bord (Hors zone interne)
             touches_via = np.any((c_mask > 0) & (hol_adj > 0))
             touches_bord = np.any((c_mask > 0) & (z_interne_stricte == 0))
             
@@ -112,29 +108,40 @@ if model_file:
         missing_pct = (np.sum(clean_voids) / area_total_px * 100) if area_total_px > 0 else 0
         max_void_pct = (v_max_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # Overlay
+        # --- CRÉATION DE L'OVERLAY ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[clean_solder] = [255, 255, 0]
-        overlay[clean_voids > 0] = [255, 0, 0]
+        overlay[clean_solder] = [0, 50, 150]    # Bleu Foncé soutenu
+        overlay[clean_voids > 0] = [255, 0, 0]  # Rouge
+        
         if v_max_poly is not None:
-            cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 2)
+            # Bleu Ciel (Cyan) épais : épaisseur 3
+            cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3)
 
-        # Affichage
+        # --- AFFICHAGE CÔTE À CÔTE ---
         st.divider()
-        col_res, col_img = st.columns([1, 2])
-        with col_res:
+        col_left, col_right = st.columns(2)
+        
+        with col_left:
+            st.subheader("🖼️ Image Originale (Réf)")
+            # On affiche l'image d'origine avec le CLAHE appliqué pour que l'opérateur voit ce que l'IA voit
+            st.image(img_gray, use_container_width=True, caption="Utile pour ajuster l'alignement")
+            
+            # Métriques en dessous de l'image de référence
             st.metric("Manque Total", f"{missing_pct:.2f} %")
             st.metric("Void Majeur (Enclavé)", f"{max_void_pct:.3f} %")
-            st.metric("Confiance IA", f"{mean_conf:.1f} %")
-            if st.button("📥 Archiver", use_container_width=True):
-                _, img_jpg = cv2.imencode(".jpg", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+        with col_right:
+            st.subheader("🤖 Analyse IA (Masque)")
+            st.image(overlay, use_container_width=True, caption="Bleu: Soudure | Rouge: Manque | Cyan: Max Void")
+            
+            if st.button("📥 Archiver le résultat", use_container_width=True):
                 st.session_state.history.append({
-                    "Fichier": rx_upload.name, "Total_%": round(missing_pct, 2),
-                    "Void_Max_%": round(max_void_pct, 3), "Heure": datetime.datetime.now().strftime("%H:%M:%S")
+                    "Fichier": rx_upload.name, 
+                    "Total_%": round(missing_pct, 2),
+                    "Void_Max_%": round(max_void_pct, 3), 
+                    "Heure": datetime.datetime.now().strftime("%H:%M:%S")
                 })
-                st.toast("Ajouté à l'historique")
-        with col_img:
-            st.image(overlay, use_container_width=True)
+                st.toast("Résultat ajouté à l'historique")
 
 # --- RAPPORT, ZIP ET GALERIE (FONCTIONS RESTAURÉES) ---
 if st.session_state.history:
