@@ -35,16 +35,15 @@ if model_file:
         rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
         sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
-        # --- CHARGEMENT SÉCURISÉ ---
+        # --- CHARGEMENT ---
         rx_upload.seek(0)
-        file_bytes = np.frombuffer(rx_upload.read(), np.uint8)
-        img_raw = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+        img_raw = cv2.imdecode(np.frombuffer(rx_upload.read(), np.uint8), cv2.IMREAD_GRAYSCALE)
         
         if img_raw is None:
-            st.error("Erreur de lecture de l'image.")
+            st.error("Erreur de lecture.")
             st.stop()
 
-        # Application du contraste (Utilisation locale du CLAHE pour éviter l'erreur d'argument)
+        # Application CLAHE locale
         if contrast_val > 0:
             clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8))
             img_gray = clahe.apply(img_raw)
@@ -53,39 +52,34 @@ if model_file:
 
         H, W = img_gray.shape
 
-        # --- TRAITEMENT MASQUE ---
+        # --- MASQUE ---
         mask_upload.seek(0)
-        m_bytes = np.frombuffer(mask_upload.read(), np.uint8)
-        insp_raw = cv2.imdecode(m_bytes, cv2.IMREAD_COLOR)
-        insp_rgb = cv2.cvtColor(insp_raw, cv2.COLOR_BGR2RGB)
-        r_r, g_r, b_r = cv2.split(insp_rgb)
-        
+        insp_raw = cv2.imdecode(np.frombuffer(mask_upload.read(), np.uint8), cv2.IMREAD_COLOR)
+        r_r, g_r, b_r = cv2.split(cv2.cvtColor(insp_raw, cv2.COLOR_BGR2RGB))
         m_green = (g_r > 100).astype(np.uint8)
         m_black = ((r_r < 100) & (g_r < 100) & (b_r < 100) & (m_green > 0)).astype(np.uint8)
         
         M = engine.compose_similarity(sc, rot, float(tx), float(ty), W/2, H/2)
         env_adj = cv2.warpAffine(cv2.resize(m_green, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         hol_adj = cv2.warpAffine(cv2.resize(m_black, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
-        
-        # ZONE UTILE = DANS LE VERT ET HORS DU NOIR
         z_utile = (env_adj > 0) & (hol_adj == 0)
 
-        # --- IA : PRÉDICTION ---
+        # --- IA ET LOGIQUE DES CLASSES (INVERSÉE) ---
         features = engine.compute_features(img_gray)
-        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
-        pred_map = np.argmax(probs, axis=1).reshape(H, W)
+        pred_map = np.argmax(clf.predict_proba(features.reshape(-1, features.shape[-1])), axis=1).reshape(H, W)
         
-        # Filtrage immédiat par le masque pour éviter le rouge partout
-        # Manque = Classe 0
-        void_raw = ((pred_map == 0) & (z_utile)).astype(np.uint8)
+        # Ici, on inverse la logique pour correspondre à tes images :
+        # Si pred_map == 1 était la soudure (Rouge sur ton image précédente)
+        # On définit maintenant MANQUE = pred_map == 1 (Pour le mettre en ROUGE)
+        # Et SOUDURE = pred_map == 0 (Pour le mettre en BLEU)
         
+        void_raw = ((pred_map == 1) & (z_utile)).astype(np.uint8) 
         kernel = np.ones((3,3), np.uint8)
         clean_voids = cv2.morphologyEx(void_raw, cv2.MORPH_OPEN, kernel)
         
-        # Soudure = Classe 1 (Zone utile qui n'est pas un manque)
         clean_solder = (z_utile) & (clean_voids == 0)
 
-        # --- RECHERCHE VOID MAJEUR ---
+        # --- CALCUL VOID MAJEUR ---
         v_max_area, v_max_poly = 0, None
         z_stricte = cv2.erode(z_utile.astype(np.uint8), kernel, iterations=1)
         cnts, _ = cv2.findContours((clean_voids * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -99,13 +93,16 @@ if model_file:
                 if area > v_max_area:
                     v_max_area, v_max_poly = area, c
 
-        # --- RENDU ---
+        # --- RENDU VISUEL ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         
-        # On ne colorie QUE les pixels du masque
-        overlay[clean_solder] = [0, 50, 150]    # Bleu foncé pour la soudure
-        overlay[clean_voids > 0] = [255, 0, 0]  # Rouge pour les manques
+        # SOUDURE PRÉSENTE -> BLEU FONCÉ
+        overlay[clean_solder] = [0, 50, 150]
         
+        # MANQUES / VOIDS -> ROUGE
+        overlay[clean_voids > 0] = [255, 0, 0]
+        
+        # VOID MAX -> CONTOUR CYAN ÉPAIS
         if v_max_poly is not None:
             cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3)
 
@@ -122,5 +119,5 @@ if model_file:
         with col_ia:
             st.subheader("🤖 Analyse IA")
             st.image(overlay, use_container_width=True)
-            if st.button("📥 Archiver le résultat", key="btn_arch_v3", use_container_width=True):
-                st.toast("Archivé !")
+            if st.button("📥 Archiver", key="final_btn_v5", use_container_width=True):
+                st.toast("Résultat archivé")
