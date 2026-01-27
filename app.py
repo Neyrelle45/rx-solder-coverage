@@ -3,10 +3,9 @@ import cv2
 import numpy as np
 import pandas as pd
 import joblib
-import datetime
 import analyse_rx_soudure as engine 
 
-st.set_page_config(page_title="RX Expert - Analyse Unitaire", layout="wide")
+st.set_page_config(page_title="RX Expert - Correction Définitive", layout="wide")
 
 if 'history' not in st.session_state:
     st.session_state.history = []
@@ -34,24 +33,16 @@ if model_file:
         rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
         sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
-        # --- CHARGEMENT ---
+        # --- CHARGEMENT ET CLAHE ---
         rx_upload.seek(0)
         img_raw = cv2.imdecode(np.frombuffer(rx_upload.read(), np.uint8), cv2.IMREAD_GRAYSCALE)
-        
-        if img_raw is None:
-            st.error("Erreur de lecture.")
-            st.stop()
+        if img_raw is None: st.stop()
 
-        # CLAHE local
-        if contrast_val > 0:
-            clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8))
-            img_gray = clahe.apply(img_raw)
-        else:
-            img_gray = img_raw
-
+        clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8)) if contrast_val > 0 else None
+        img_gray = clahe.apply(img_raw) if clahe else img_raw
         H, W = img_gray.shape
 
-        # --- MASQUE ---
+        # --- MASQUE ET ZONE UTILE ---
         mask_upload.seek(0)
         insp_raw = cv2.imdecode(np.frombuffer(mask_upload.read(), np.uint8), cv2.IMREAD_COLOR)
         r_r, g_r, b_r = cv2.split(cv2.cvtColor(insp_raw, cv2.COLOR_BGR2RGB))
@@ -63,64 +54,53 @@ if model_file:
         hol_adj = cv2.warpAffine(cv2.resize(m_black, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj > 0) & (hol_adj == 0)
 
-        # --- IA : CALCUL ---
+        # --- ANALYSE IA ---
         features = engine.compute_features(img_gray)
-        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
-        pred_map = np.argmax(probs, axis=1).reshape(H, W)
-        
-        # --- LOGIQUE DE COULEUR (CORRECTE) ---
-        # D'après tes images, la Classe 1 (Soudure) sortait en Rouge. 
-        # On définit donc ici que pour l'affichage :
-        # Classe 1 = BLEU FONCÉ (Soudure)
-        # Classe 0 = ROUGE (Manques)
-        
-        # 1. Extraction des manques (Classe 0)
-        void_mask = ((pred_map == 0) & (z_utile)).astype(np.uint8)
-        kernel = np.ones((3,3), np.uint8)
-        clean_voids = cv2.morphologyEx(void_mask, cv2.MORPH_OPEN, kernel)
-        
-        # 2. Extraction de la soudure (Classe 1)
-        clean_solder = ((pred_map == 1) & (z_utile)).astype(np.uint8)
+        pred_map = clf.predict(features.reshape(-1, features.shape[-1])).reshape(H, W)
 
-        # --- VOID MAJEUR ---
-        v_max_area, v_max_poly = 0, None
-        z_stricte = cv2.erode(z_utile.astype(np.uint8), kernel, iterations=1)
-        cnts, _ = cv2.findContours((clean_voids * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for c in cnts:
-            area = cv2.contourArea(c)
-            if area < 10: continue
-            c_m = np.zeros((H, W), dtype=np.uint8)
-            cv2.drawContours(c_m, [c], -1, 255, -1)
-            if not np.any((c_m > 0) & (hol_adj > 0)) and not np.any((c_m > 0) & (z_stricte == 0)):
-                if area > v_max_area:
-                    v_max_area, v_max_poly = area, c
-
-        # --- RENDU FINAL ---
+        # --- LOGIQUE DE COULEUR FORCÉE ---
+        # 1. On crée l'image de base (niveaux de gris)
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         
-        # On applique le BLEU sur la soudure (Classe 1)
-        overlay[clean_solder > 0] = [0, 50, 150]
+        # 2. On identifie la soudure (matière sombre)
+        # On force le BLEU sur la soudure (Classe identifiée comme matière)
+        # Si le rouge persiste, on inverse manuellement les labels ici :
+        label_soudure = 1 # Change en 0 si la soudure reste rouge
+        label_manque = 0  # Change en 1 si le manque reste bleu
         
-        # On applique le ROUGE sur les manques (Classe 0)
-        overlay[clean_voids > 0] = [255, 0, 0]
+        mask_soudure = ((pred_map == label_soudure) & (z_utile))
+        mask_manque = ((pred_map == label_manque) & (z_utile))
+
+        # --- APPLICATION DES COULEURS ---
+        # SOUDURE = BLEU
+        overlay[mask_soudure] = [0, 50, 160]
         
-        # Contour Cyan pour le void max
+        # MANQUES = ROUGE (On applique après pour qu'ils soient au-dessus)
+        overlay[mask_manque] = [255, 0, 0]
+
+        # --- VOID MAJEUR (CYAN) ---
+        v_max_area, v_max_poly = 0, None
+        cnts, _ = cv2.findContours((mask_manque.astype(np.uint8)*255), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if area > v_max_area:
+                v_max_area, v_max_poly = area, c
+        
         if v_max_poly is not None:
             cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3)
 
         # --- AFFICHAGE ---
         st.divider()
-        col_ref, col_ia = st.columns(2)
-        with col_ref:
+        c1, c2 = st.columns(2)
+        with c1:
             st.subheader("🖼️ Image Originale")
             st.image(img_gray, use_container_width=True)
             area_tot = np.sum(z_utile)
-            st.metric("Manque Total (Rouge)", f"{(np.sum(clean_voids)/area_tot*100):.2f} %" if area_tot > 0 else "0 %")
-            st.metric("Void Majeur (Cyan)", f"{(v_max_area/area_tot*100):.3f} %" if area_tot > 0 else "0 %")
-
-        with col_ia:
+            st.metric("Manque Total (Rouge)", f"{(np.sum(mask_manque)/area_tot*100):.2f} %")
+        with c2:
             st.subheader("🤖 Analyse IA")
             st.image(overlay, use_container_width=True)
-            if st.button("📥 Archiver", key="final_v7", use_container_width=True):
-                st.toast("Archivé")
+            
+            # BOUTON DE SECOURS : Si les couleurs sont encore inversées
+            if st.button("🔄 Inverser Soudure/Manque"):
+                st.info("Inversez les variables 'label_soudure' et 'label_manque' dans le code ligne 54-55.")
