@@ -61,66 +61,65 @@ if model_file:
         z_utile = (env_adj & ~hol_adj)
 
         # Analyse IA
-# --- 1. PRÉDICTION IA ET NETTOYAGE ---
+# --- 1. PRÉDICTION IA ---
         features = engine.compute_features(img_gray)
         probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
         pred_map = np.argmax(probs, axis=1).reshape(H, W)
         
-        # Calcul de la confiance (on le définit bien ici pour éviter l'erreur)
+        # Confiance IA
         conf_map = np.max(probs, axis=1).reshape(H, W)
         mean_conf = np.mean(conf_map[z_utile > 0]) * 100 if np.any(z_utile) else 0
 
-        # Suppression du bruit (Opening) pour éviter les points rouges isolés
+        # --- 2. NETTOYAGE ET LOGIQUE BINAIRE (ANTI-POINTS NOIRS) ---
+        # On définit le manque (Classe 0)
+        void_mask = ((pred_map == 0) & (z_utile > 0)).astype(np.uint8)
+        
+        # On applique un filtre morphologique pour lisser les bords et virer le bruit
         kernel = np.ones((3,3), np.uint8)
-        clean_voids = cv2.morphologyEx(((pred_map == 0) & (z_utile > 0)).astype(np.uint8), cv2.MORPH_OPEN, kernel)
-        clean_solder = cv2.morphologyEx(((pred_map == 1) & (z_utile > 0)).astype(np.uint8), cv2.MORPH_OPEN, kernel)
+        clean_voids = cv2.morphologyEx(void_mask, cv2.MORPH_OPEN, kernel)
+        
+        # LOGIQUE BINAIRE : Tout ce qui est dans z_utile et qui n'est pas un VOID est de la SOUDURE
+        # Cela élimine radicalement les points noirs/gris dans le masque
+        clean_solder = (z_utile > 0) & (clean_voids == 0)
 
-        # --- 2. CALCULS DE SURFACES ---
+        # --- 3. CALCULS ---
         area_total_px = np.sum(z_utile > 0)
-        # Le manque total est la somme des pixels rouges nettoyés
         missing_pct = (np.sum(clean_voids) / area_total_px * 100.0) if area_total_px > 0 else 0
 
-        # --- 3. LOGIQUE DU VOID MAJEUR ENCLAVÉ ---
+        # --- 4. LOGIQUE VOID MAJEUR ---
         max_void_area = 0
         max_void_poly = None
+        
+        # On cherche les trous dans la zone de soudure
+        solder_u8 = clean_solder.astype(np.uint8) * 255
+        # Ici on utilise RETR_CCOMP pour trouver les trous internes directement
+        contours, hierarchy = cv2.findContours(solder_u8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
 
-        # On cherche les îlots de soudure (jaunes)
-        solder_u8 = (clean_solder > 0).astype(np.uint8) * 255
-        solder_cnts, _ = cv2.findContours(solder_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for s_cnt in solder_cnts:
-            s_mask = np.zeros((H, W), dtype=np.uint8)
-            cv2.drawContours(s_mask, [s_cnt], -1, 255, -1)
-            
-            # Trous = Zones classées rouges par l'IA situées DANS l'îlot jaune
-            holes_in_island = cv2.bitwise_and(s_mask, (clean_voids * 255).astype(np.uint8))
-            h_cnts, _ = cv2.findContours(holes_in_island, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for h_cnt in h_cnts:
-                area = cv2.contourArea(h_cnt)
-                if area < 10.0: continue
-                
-                # Masque spécifique à ce trou pour tester l'exclusion
-                h_mask = np.zeros((H, W), dtype=np.uint8)
-                cv2.drawContours(h_mask, [h_cnt], -1, 255, -1)
-                
-                # CRITÈRE D'EXCLUSION : Ne doit pas toucher une zone noire (via)
-                # On vérifie l'intersection avec hol_adj
-                if np.any((h_mask > 0) & (hol_adj > 0)):
-                    continue
-                
-                if area > max_void_area:
-                    max_void_area = area
-                    max_void_poly = h_cnt
+        if hierarchy is not None:
+            for i, cnt in enumerate(contours):
+                # Un trou est un contour qui a un parent (hiérarchie[0][i][3] != -1)
+                if hierarchy[0][i][3] != -1:
+                    area = cv2.contourArea(cnt)
+                    if area < 10: continue
+                    
+                    # Test d'exclusion des Vias
+                    h_mask = np.zeros((H, W), dtype=np.uint8)
+                    cv2.drawContours(h_mask, [cnt], -1, 255, -1)
+                    if np.any((h_mask > 0) & (hol_adj > 0)):
+                        continue
+                        
+                    if area > max_void_area:
+                        max_void_area = area
+                        max_void_poly = cnt
 
         max_void_pct = (max_void_area / area_total_px * 100) if area_total_px > 0 else 0
 
-        # --- 4. OVERLAY ---
+        # --- 5. OVERLAY FINAL ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
-        overlay[clean_solder > 0] = [255, 255, 0] # Soudure en Jaune
-        overlay[clean_voids > 0] = [255, 0, 0]   # Manques en Rouge
+        overlay[clean_solder] = [255, 255, 0] # Jaune (Remplit tout le pad)
+        overlay[clean_voids > 0] = [255, 0, 0] # Rouge (Par-dessus le jaune)
+        
         if max_void_poly is not None:
-            # On entoure le plus gros d'un liseré Cyan
             cv2.drawContours(overlay, [max_void_poly], -1, [0, 255, 255], 2)
 
         # Affichage et Archivage
