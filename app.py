@@ -6,7 +6,7 @@ import joblib
 import datetime
 import analyse_rx_soudure as engine 
 
-st.set_page_config(page_title="RX Expert - Correction Finale", layout="wide")
+st.set_page_config(page_title="RX Expert - Version Corrigée", layout="wide")
 
 if 'history' not in st.session_state:
     st.session_state.history = []
@@ -20,7 +20,7 @@ if model_file:
     def load_my_model(file): return joblib.load(file)
     clf = load_my_model(model_file)
 
-    st.header("🔍 Analyse Comparative Rectifiée")
+    st.header("🔍 Analyse Comparative")
     
     c_u, c_m = st.columns(2)
     with c_u: rx_upload = st.file_uploader("1. Image RX", type=["png", "jpg", "jpeg", "tif"])
@@ -43,8 +43,12 @@ if model_file:
             st.stop()
 
         # CLAHE local
-        clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8)) if contrast_val > 0 else None
-        img_gray = clahe.apply(img_raw) if clahe else img_raw
+        if contrast_val > 0:
+            clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8))
+            img_gray = clahe.apply(img_raw)
+        else:
+            img_gray = img_raw
+
         H, W = img_gray.shape
 
         # --- MASQUE ---
@@ -59,24 +63,18 @@ if model_file:
         hol_adj = cv2.warpAffine(cv2.resize(m_black, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj > 0) & (hol_adj == 0)
 
-        # --- IA : CALCUL DES PROBABILITÉS ---
+        # --- IA : CALCUL ---
         features = engine.compute_features(img_gray)
-        # On récupère les probabilités au lieu de la classe directe pour plus de finesse
-        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
+        pred_map = np.argmax(clf.predict_proba(features.reshape(-1, features.shape[-1])), axis=1).reshape(H, W)
         
-        # LOGIQUE : 
-        # Classe 0 = Manque (Zones claires) -> On veut du ROUGE
-        # Classe 1 = Soudure (Zones sombres) -> On veut du BLEU
-        pred_map = np.argmax(probs, axis=1).reshape(H, W)
-        
-        # --- FILTRAGE ET NETTOYAGE ---
-        # On définit le manque comme étant la Classe 0 (JAUNE dans tes labels d'origine)
+        # --- LOGIQUE DE COULEUR FIXÉE ---
+        # Si Classe 1 = Soudure (Sombres) et Classe 0 = Manques (Clairs)
+        # On définit les masques binaires pour le rendu
         void_mask = ((pred_map == 0) & (z_utile)).astype(np.uint8)
-        
         kernel = np.ones((3,3), np.uint8)
         clean_voids = cv2.morphologyEx(void_mask, cv2.MORPH_OPEN, kernel)
         
-        # On définit la soudure comme tout le reste de la zone utile
+        # La soudure est tout ce qui est dans z_utile mais n'est pas un manque
         clean_solder = (z_utile) & (clean_voids == 0)
 
         # --- VOID MAJEUR ---
@@ -96,14 +94,13 @@ if model_file:
         # --- RENDU FINAL ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         
-        # 1. On applique la SOUDURE en BLEU FONCÉ partout dans z_utile
-        # (On part du principe que la zone est pleine par défaut)
-        overlay[z_utile] = [0, 50, 150]
+        # 1. SOUDURE EN BLEU FONCÉ
+        overlay[clean_solder] = [0, 50, 150]
         
-        # 2. On "troue" le bleu avec le ROUGE là où l'IA voit des manques (Classe 0)
+        # 2. MANQUES EN ROUGE
         overlay[clean_voids > 0] = [255, 0, 0]
         
-        # 3. On entoure le void max en CYAN
+        # 3. VOID MAX EN CYAN ÉPAIS
         if v_max_poly is not None:
             cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3)
 
@@ -120,5 +117,5 @@ if model_file:
         with col_ia:
             st.subheader("🤖 Analyse IA")
             st.image(overlay, use_container_width=True)
-            if st.button("📥 Archiver", key="final_fix_btn", use_container_width=True):
-                st.toast("Archivé")
+            if st.button("📥 Archiver", key="fix_v6", use_container_width=True):
+                st.toast("Résultat archivé")
