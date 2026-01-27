@@ -545,7 +545,7 @@ def train_model(images_dir: str, labels_dir: str, models_dir: str = "./MyDrive/O
         raise RuntimeError("Aucun pixel labelisé trouvé. Ajoute des scribbles rouge/jaune dans ./MyDrive/OBC_mainboard/labels.")
 
     X = np.vstack(Xs); y = np.concatenate(ys)
-    clf = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, class_weight="balanced", random_state=42, max_depth=10, min_samples_leaf=100).fit(X, y)
+    clf = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, class_weight="balanced", random_state=42, max_depth=None, min_samples_leaf=2).fit(X, y)
 
     yp = clf.predict(X)
     print("=== Rapport d'entraînement (indicatif) ===")
