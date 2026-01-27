@@ -82,11 +82,24 @@ if trigger and model_file and uploaded_rx and mask_file:
         # LOGIQUE BINAIRE : La soudure (jaune) est tout ce qui n'est pas rouge dans z_inspectee
         mask_yellow = (z_inspectee > 0) & (mask_red == 0)
 
-# --- 4. LOGIQUE VOID MAX (OPTIMISÉE ANTI-VIAS) ---
+C'est un point critique : on doit distinguer le manque de soudure structurel (qui peut être en bordure de pad) du void sphérique/bulle (qui est piégé à l'intérieur).
+
+Le problème est que si un "manque" touche le bord du masque, il n'est plus "enclavé". Dans ta définition métier, un Void Majeur doit être une bulle interne, tandis que les bords grignotés sont des Manques.
+
+Voici comment verrouiller la logique dans app_batch.py pour que le Void Max (Cyan) ne soit calculé que sur des formes "fermées", tout en comptant tout le rouge dans le Manque Total.
+
+Correction de la Logique de Distinction
+On va utiliser une érosion du masque d'inspection pour créer une "zone de sécurité". Si un défaut rouge touche cette zone de sécurité (la bordure), il est déclassé du titre de "Void Max".
+
+Python
+        # --- 4. LOGIQUE VOID MAX (STRICTEMENT ENCLAVÉ) ---
         v_max_area, v_max_poly = 0, None
         
-        # On cherche tous les contours ROUGES (Manques détectés par l'IA)
-        # On ne passe plus par les trous du jaune pour éviter de capturer les vias
+        # On crée une bordure interne de sécurité (3 pixels)
+        # Tout ce qui touche cette bordure est considéré comme "Manque de bord" et non "Void"
+        kernel_border = np.ones((3,3), np.uint8)
+        z_interne_stricte = cv2.erode(z_inspectee, kernel_border, iterations=1)
+        
         red_u8 = mask_red.astype(np.uint8) * 255
         cnts, _ = cv2.findContours(red_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
@@ -94,22 +107,22 @@ if trigger and model_file and uploaded_rx and mask_file:
             c_area = cv2.contourArea(c)
             if c_area < 10: continue 
             
-            # Création d'un masque pour ce void précis
+            # Masque du défaut actuel
             c_mask = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(c_mask, [c], -1, 255, -1)
             
-            # --- CONDITION D'EXCLUSION CRUCIALE ---
-            # Un void est valide s'il est ENTIÈREMENT dans la zone d'inspection
-            # S'il touche un via (hol_adj) ou l'extérieur (env_adj == 0), on l'exclut du "Void Max"
+            # --- TESTS DE VALIDITÉ POUR "VOID MAJEUR" ---
             
-            # 1. Touche-t-il un via ?
+            # 1. Exclusion des Vias (Noir)
             touches_via = np.any((c_mask > 0) & (hol_adj > 0))
             
-            # 2. Est-il sur le bord du pad ? (Optionnel mais conseillé pour le "Void Majeur Enclavé")
-            # On vérifie s'il sort de la zone verte
-            touche_bord = np.any((c_mask > 0) & (env_adj == 0))
+            # 2. Exclusion des Bords (Si le défaut touche la zone hors 'interne_stricte')
+            # Si un pixel du défaut est dans z_inspectee mais PAS dans z_interne_stricte, 
+            # c'est qu'il touche le bord du masque vert.
+            touches_bord = np.any((c_mask > 0) & (z_interne_stricte == 0))
             
-            if not touches_via and not touche_bord:
+            # 3. Validation
+            if not touches_via and not touches_bord:
                 if c_area > v_max_area:
                     v_max_area = c_area
                     v_max_poly = c
@@ -126,9 +139,10 @@ if trigger and model_file and uploaded_rx and mask_file:
             cv2.drawContours(res_rgb, [v_max_poly], -1, [0, 255, 255], 2)
 
         # 6. CALCULS & HISTORIQUE
-# Le total reste la somme de tous les rouges (même ceux touchant les vias)
+# Le "Total" comptabilise TOUT le rouge (bords + vias inclus ou non)
         total_pct = (np.sum(mask_red) / area_ref * 100) if area_ref > 0 else 0
-        # Le void max est uniquement un void "propre" et interne
+        
+        # Le "Void Max" est le plus gros des défauts "propres" (ni bord, ni via)
         void_max_pct = (v_max_area / area_ref * 100) if area_ref > 0 else 0
 
         _, enc = cv2.imencode(".jpg", cv2.cvtColor(res_rgb, cv2.COLOR_RGB2BGR))
