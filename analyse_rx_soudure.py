@@ -17,7 +17,15 @@ except:
 # UTILS
 # =========================
 def load_gray(p, contrast_limit=2.0):
-    img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+    # Si p est un chemin (string)
+    if isinstance(p, (str, os.PathLike)):
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+    else:
+        # Si p est un objet de type fichier (Streamlit)
+        p.seek(0) # On remet au début au cas où
+        file_bytes = np.frombuffer(p.read(), np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+    
     if img is None: return None
     if contrast_limit > 0:
         clahe = cv2.createCLAHE(clipLimit=contrast_limit, tileGridSize=(8,8))
