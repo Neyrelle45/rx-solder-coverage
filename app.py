@@ -52,7 +52,7 @@ if model_file:
 
         H, W = img_gray.shape
 
-        # --- MASQUE ---
+        # --- TRAITEMENT MASQUE ---
         mask_upload.seek(0)
         insp_raw = cv2.imdecode(np.frombuffer(mask_upload.read(), np.uint8), 1)
         r_r, g_r, b_r = cv2.split(cv2.cvtColor(insp_raw, cv2.COLOR_BGR2RGB))
@@ -64,20 +64,24 @@ if model_file:
         hol_adj = cv2.warpAffine(cv2.resize(m_black, (W, H), interpolation=cv2.INTER_NEAREST), M, (W, H), flags=cv2.INTER_NEAREST)
         z_utile = (env_adj > 0) & (hol_adj == 0)
 
-        # --- IA ---
+        # --- IA ET LOGIQUE DES CLASSES ---
         features = engine.compute_features(img_gray)
-        pred_map = np.argmax(clf.predict_proba(features.reshape(-1, features.shape[-1])), axis=1).reshape(H, W)
+        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
+        pred_map = np.argmax(probs, axis=1).reshape(H, W)
         
-        kernel = np.ones((3,3), np.uint8)
+        # RAPPEL : Labels originaux Soudure=Rouge(1), Manque=Jaune(0)
+        # On veut : Manque en ROUGE sur l'app, Soudure en BLEU
+        
+        # 1. Identifier les MANQUES (Classe 0)
         void_raw = ((pred_map == 0) & (z_utile)).astype(np.uint8)
+        kernel = np.ones((3,3), np.uint8)
         clean_voids = cv2.morphologyEx(void_raw, cv2.MORPH_OPEN, kernel)
         
-        # --- CORRECTION DES COULEURS ---
-        # clean_solder = Soudure présente (Bleu foncé)
-        # clean_voids = Manques (Rouge)
+        # 2. Identifier la SOUDURE (Classe 1)
+        # Tout ce qui est dans la zone utile et qui n'est pas un manque
         clean_solder = (z_utile) & (clean_voids == 0)
 
-        # --- VOID MAJEUR ---
+        # --- VOID MAJEUR ENCLAVÉ ---
         v_max_area, v_max_poly = 0, None
         z_stricte = cv2.erode(z_utile.astype(np.uint8), kernel, iterations=1)
         cnts, _ = cv2.findContours((clean_voids * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -87,10 +91,45 @@ if model_file:
             if area < 10: continue
             c_m = np.zeros((H, W), dtype=np.uint8)
             cv2.drawContours(c_m, [c], -1, 255, -1)
+            
+            # Exclusion si touche un via noir ou le bord du pad
             if not np.any((c_m > 0) & (hol_adj > 0)) and not np.any((c_m > 0) & (z_stricte == 0)):
                 if area > v_max_area:
                     v_max_area, v_max_poly = area, c
 
+        # --- RENDU VISUEL ---
+        overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
+        
+        # SOUDURE PRÉSENTE -> BLEU FONCÉ
+        overlay[clean_solder] = [0, 50, 150]
+        
+        # MANQUES / VOIDS -> ROUGE
+        overlay[clean_voids > 0] = [255, 0, 0]
+        
+        # VOID MAX -> CONTOUR CYAN ÉPAIS
+        if v_max_poly is not None:
+            cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3)
+
+        # --- AFFICHAGE ---
+        st.divider()
+        col_ref, col_ia = st.columns(2)
+        with col_ref:
+            st.subheader("🖼️ Image Originale (Réf)")
+            st.image(img_gray, use_container_width=True)
+            # Métriques
+            area_tot = np.sum(z_utile)
+            st.metric("Manque Total (Rouge)", f"{(np.sum(clean_voids)/area_tot*100):.2f} %" if area_tot > 0 else "0 %")
+            st.metric("Void Majeur (Cyan)", f"{(v_max_area/area_tot*100):.3f} %" if area_tot > 0 else "0 %")
+
+        with col_ia:
+            st.subheader("🤖 Analyse IA")
+            st.image(overlay, use_container_width=True)
+            if st.button("📥 Archiver", use_container_width=True):
+                st.toast("Résultat archivé dans l'historique")
+
+
+
+        
 # --- RENDU FINAL (COULEURS CORRIGÉES) ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         
