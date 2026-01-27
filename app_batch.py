@@ -82,16 +82,7 @@ if trigger and model_file and uploaded_rx and mask_file:
         # LOGIQUE BINAIRE : La soudure (jaune) est tout ce qui n'est pas rouge dans z_inspectee
         mask_yellow = (z_inspectee > 0) & (mask_red == 0)
 
-C'est un point critique : on doit distinguer le manque de soudure structurel (qui peut être en bordure de pad) du void sphérique/bulle (qui est piégé à l'intérieur).
 
-Le problème est que si un "manque" touche le bord du masque, il n'est plus "enclavé". Dans ta définition métier, un Void Majeur doit être une bulle interne, tandis que les bords grignotés sont des Manques.
-
-Voici comment verrouiller la logique dans app_batch.py pour que le Void Max (Cyan) ne soit calculé que sur des formes "fermées", tout en comptant tout le rouge dans le Manque Total.
-
-Correction de la Logique de Distinction
-On va utiliser une érosion du masque d'inspection pour créer une "zone de sécurité". Si un défaut rouge touche cette zone de sécurité (la bordure), il est déclassé du titre de "Void Max".
-
-Python
         # --- 4. LOGIQUE VOID MAX (STRICTEMENT ENCLAVÉ) ---
         v_max_area, v_max_poly = 0, None
         
