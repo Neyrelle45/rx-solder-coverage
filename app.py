@@ -6,7 +6,7 @@ import joblib
 import datetime
 import analyse_rx_soudure as engine 
 
-st.set_page_config(page_title="RX Expert - Version Corrigée", layout="wide")
+st.set_page_config(page_title="RX Expert - Analyse Unitaire", layout="wide")
 
 if 'history' not in st.session_state:
     st.session_state.history = []
@@ -65,17 +65,22 @@ if model_file:
 
         # --- IA : CALCUL ---
         features = engine.compute_features(img_gray)
-        pred_map = np.argmax(clf.predict_proba(features.reshape(-1, features.shape[-1])), axis=1).reshape(H, W)
+        probs = clf.predict_proba(features.reshape(-1, features.shape[-1]))
+        pred_map = np.argmax(probs, axis=1).reshape(H, W)
         
-        # --- LOGIQUE DE COULEUR FIXÉE ---
-        # Si Classe 1 = Soudure (Sombres) et Classe 0 = Manques (Clairs)
-        # On définit les masques binaires pour le rendu
+        # --- LOGIQUE DE COULEUR (CORRECTE) ---
+        # D'après tes images, la Classe 1 (Soudure) sortait en Rouge. 
+        # On définit donc ici que pour l'affichage :
+        # Classe 1 = BLEU FONCÉ (Soudure)
+        # Classe 0 = ROUGE (Manques)
+        
+        # 1. Extraction des manques (Classe 0)
         void_mask = ((pred_map == 0) & (z_utile)).astype(np.uint8)
         kernel = np.ones((3,3), np.uint8)
         clean_voids = cv2.morphologyEx(void_mask, cv2.MORPH_OPEN, kernel)
         
-        # La soudure est tout ce qui est dans z_utile mais n'est pas un manque
-        clean_solder = (z_utile) & (clean_voids == 0)
+        # 2. Extraction de la soudure (Classe 1)
+        clean_solder = ((pred_map == 1) & (z_utile)).astype(np.uint8)
 
         # --- VOID MAJEUR ---
         v_max_area, v_max_poly = 0, None
@@ -94,13 +99,13 @@ if model_file:
         # --- RENDU FINAL ---
         overlay = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2RGB)
         
-        # 1. SOUDURE EN BLEU FONCÉ
-        overlay[clean_solder] = [0, 50, 150]
+        # On applique le BLEU sur la soudure (Classe 1)
+        overlay[clean_solder > 0] = [0, 50, 150]
         
-        # 2. MANQUES EN ROUGE
+        # On applique le ROUGE sur les manques (Classe 0)
         overlay[clean_voids > 0] = [255, 0, 0]
         
-        # 3. VOID MAX EN CYAN ÉPAIS
+        # Contour Cyan pour le void max
         if v_max_poly is not None:
             cv2.drawContours(overlay, [v_max_poly], -1, [0, 255, 255], 3)
 
@@ -117,5 +122,5 @@ if model_file:
         with col_ia:
             st.subheader("🤖 Analyse IA")
             st.image(overlay, use_container_width=True)
-            if st.button("📥 Archiver", key="fix_v6", use_container_width=True):
-                st.toast("Résultat archivé")
+            if st.button("📥 Archiver", key="final_v7", use_container_width=True):
+                st.toast("Archivé")
