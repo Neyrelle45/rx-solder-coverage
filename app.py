@@ -34,8 +34,22 @@ if model_file:
         rot = st.sidebar.slider("Rotation (°)", -180.0, 180.0, 0.0)
         sc = st.sidebar.slider("Échelle", 0.8, 1.2, 1.0)
 
-        # Chargement et préparation
-        img_gray = engine.load_gray(rx_upload, contrast_limit=contrast_val)
+# --- CHARGEMENT SÉCURISÉ DE L'IMAGE ---
+        # On lit le fichier uploadé en bytes pour OpenCV
+        file_bytes = np.frombuffer(rx_upload.read(), np.uint8)
+        img_raw = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+
+        if img_raw is None:
+            st.error("Impossible de lire l'image RX. Vérifiez le format du fichier.")
+            st.stop()
+
+        # Application du contraste (CLAHE) via le moteur
+        if contrast_val > 0:
+            clahe = cv2.createCLAHE(clipLimit=contrast_val, tileGridSize=(8,8))
+            img_gray = clahe.apply(img_raw)
+        else:
+            img_gray = img_raw
+
         H, W = img_gray.shape
 
         # Traitement Masque
